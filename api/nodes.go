@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
-
-	"github.com/hashicorp/go-cleanhttp"
 )
 
 // Nodes is used to query node-related API endpoints
@@ -82,10 +80,7 @@ func (n *Nodes) Stats(nodeID string, q *QueryOptions) (*HostStats, error) {
 	if node.HTTPAddr == "" {
 		return nil, fmt.Errorf("http addr of the node %q is running is not advertised", nodeID)
 	}
-	client, err := NewClient(&Config{
-		Address:    fmt.Sprintf("http://%s", node.HTTPAddr),
-		HttpClient: cleanhttp.DefaultClient(),
-	})
+	client, err := NewClient(n.client.config.CopyConfig(node.HTTPAddr, node.TLSEnabled))
 	if err != nil {
 		return nil, err
 	}
@@ -96,12 +91,30 @@ func (n *Nodes) Stats(nodeID string, q *QueryOptions) (*HostStats, error) {
 	return &resp, nil
 }
 
+func (n *Nodes) GC(nodeID string, q *QueryOptions) error {
+	node, _, err := n.client.Nodes().Info(nodeID, q)
+	if err != nil {
+		return err
+	}
+	if node.HTTPAddr == "" {
+		return fmt.Errorf("http addr of the node %q is running is not advertised", nodeID)
+	}
+	client, err := NewClient(n.client.config.CopyConfig(node.HTTPAddr, node.TLSEnabled))
+	if err != nil {
+		return err
+	}
+	var resp struct{}
+	_, err = client.query("/v1/client/gc", &resp, nil)
+	return err
+}
+
 // Node is used to deserialize a node entry.
 type Node struct {
 	ID                string
 	Datacenter        string
 	Name              string
 	HTTPAddr          string
+	TLSEnabled        bool
 	Attributes        map[string]string
 	Resources         *Resources
 	Reserved          *Resources

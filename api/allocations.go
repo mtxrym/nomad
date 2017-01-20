@@ -4,8 +4,12 @@ import (
 	"fmt"
 	"sort"
 	"time"
+)
 
-	"github.com/hashicorp/go-cleanhttp"
+var (
+	// NodeDownErr marks an operation as not able to complete since the node is
+	// down.
+	NodeDownErr = fmt.Errorf("node down")
 )
 
 // Allocations is used to query the alloc-related endpoints.
@@ -48,19 +52,40 @@ func (a *Allocations) Stats(alloc *Allocation, q *QueryOptions) (*AllocResourceU
 	if err != nil {
 		return nil, err
 	}
+	if node.Status == "down" {
+		return nil, NodeDownErr
+	}
 	if node.HTTPAddr == "" {
 		return nil, fmt.Errorf("http addr of the node where alloc %q is running is not advertised", alloc.ID)
 	}
-	client, err := NewClient(&Config{
-		Address:    fmt.Sprintf("http://%s", node.HTTPAddr),
-		HttpClient: cleanhttp.DefaultClient(),
-	})
+	client, err := NewClient(a.client.config.CopyConfig(node.HTTPAddr, node.TLSEnabled))
 	if err != nil {
 		return nil, err
 	}
 	var resp AllocResourceUsage
 	_, err = client.query("/v1/client/allocation/"+alloc.ID+"/stats", &resp, nil)
 	return &resp, err
+}
+
+func (a *Allocations) GC(alloc *Allocation, q *QueryOptions) error {
+	node, _, err := a.client.Nodes().Info(alloc.NodeID, q)
+	if err != nil {
+		return err
+	}
+	if node.Status == "down" {
+		return NodeDownErr
+	}
+	if node.HTTPAddr == "" {
+		return fmt.Errorf("http addr of the node where alloc %q is running is not advertised", alloc.ID)
+	}
+	client, err := NewClient(a.client.config.CopyConfig(node.HTTPAddr, node.TLSEnabled))
+	if err != nil {
+		return err
+	}
+
+	var resp struct{}
+	_, err = client.query("/v1/client/allocation"+alloc.ID+"/gc", &resp, nil)
+	return err
 }
 
 // Allocation is used for serialization of allocations.
@@ -81,8 +106,10 @@ type Allocation struct {
 	ClientStatus       string
 	ClientDescription  string
 	TaskStates         map[string]*TaskState
+	PreviousAllocation string
 	CreateIndex        uint64
 	ModifyIndex        uint64
+	AllocModifyIndex   uint64
 	CreateTime         int64
 }
 

@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hashicorp/consul/tlsutil"
 	"github.com/hashicorp/net-rpc-msgpackrpc"
+	"github.com/hashicorp/nomad/helper/tlsutil"
 	"github.com/hashicorp/yamux"
 )
 
@@ -129,7 +129,7 @@ type ConnPool struct {
 	limiter map[string]chan struct{}
 
 	// TLS wrapper
-	tlsWrap tlsutil.DCWrapper
+	tlsWrap tlsutil.RegionWrapper
 
 	// Used to indicate the pool is shutdown
 	shutdown   bool
@@ -141,7 +141,7 @@ type ConnPool struct {
 // Set maxTime to 0 to disable reaping. maxStreams is used to control
 // the number of idle streams allowed.
 // If TLS settings are provided outgoing connections use TLS.
-func NewPool(logOutput io.Writer, maxTime time.Duration, maxStreams int, tlsWrap tlsutil.DCWrapper) *ConnPool {
+func NewPool(logOutput io.Writer, maxTime time.Duration, maxStreams int, tlsWrap tlsutil.RegionWrapper) *ConnPool {
 	pool := &ConnPool{
 		logOutput:  logOutput,
 		maxTime:    maxTime,

@@ -141,22 +141,28 @@ type LogConfig struct {
 	MaxFileSizeMB int
 }
 
+// DispatchInputConfig configures how a task gets its input from a job dispatch
+type DispatchInputConfig struct {
+	File string
+}
+
 // Task is a single process in a task group.
 type Task struct {
-	Name        string
-	Driver      string
-	User        string
-	Config      map[string]interface{}
-	Constraints []*Constraint
-	Env         map[string]string
-	Services    []Service
-	Resources   *Resources
-	Meta        map[string]string
-	KillTimeout time.Duration
-	LogConfig   *LogConfig
-	Artifacts   []*TaskArtifact
-	Vault       *Vault
-	Templates   []*Template
+	Name          string
+	Driver        string
+	User          string
+	Config        map[string]interface{}
+	Constraints   []*Constraint
+	Env           map[string]string
+	Services      []Service
+	Resources     *Resources
+	Meta          map[string]string
+	KillTimeout   time.Duration
+	LogConfig     *LogConfig
+	Artifacts     []*TaskArtifact
+	Vault         *Vault
+	Templates     []*Template
+	DispatchInput *DispatchInputConfig
 }
 
 // TaskArtifact is used to download artifacts before running a task.
@@ -231,12 +237,14 @@ func (t *Task) SetLogConfig(l *LogConfig) *Task {
 // transitions.
 type TaskState struct {
 	State  string
+	Failed bool
 	Events []*TaskEvent
 }
 
 const (
 	TaskSetupFailure           = "Setup Failure"
 	TaskDriverFailure          = "Driver Failure"
+	TaskDriverMessage          = "Driver"
 	TaskReceived               = "Received"
 	TaskFailedValidation       = "Failed Validation"
 	TaskStarted                = "Started"
@@ -247,7 +255,6 @@ const (
 	TaskNotRestarting          = "Not Restarting"
 	TaskDownloadingArtifacts   = "Downloading Artifacts"
 	TaskArtifactDownloadFailed = "Failed Artifact Download"
-	TaskDiskExceeded           = "Disk Exceeded"
 	TaskVaultRenewalFailed     = "Vault token renewal failed"
 	TaskSiblingFailed          = "Sibling task failed"
 	TaskSignaling              = "Signaling"
@@ -259,9 +266,11 @@ const (
 type TaskEvent struct {
 	Type             string
 	Time             int64
+	FailsTask        bool
 	RestartReason    string
 	SetupError       string
 	DriverError      string
+	DriverMessage    string
 	ExitCode         int
 	Signal           int
 	Message          string

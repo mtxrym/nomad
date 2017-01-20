@@ -5,19 +5,15 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-plugin"
 	"github.com/hashicorp/nomad/client/allocdir"
-	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver/executor"
 	dstructs "github.com/hashicorp/nomad/client/driver/structs"
 	cstructs "github.com/hashicorp/nomad/client/structs"
-	"github.com/hashicorp/nomad/helper/discover"
 	"github.com/hashicorp/nomad/helper/fields"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/mitchellh/mapstructure"
@@ -46,7 +42,7 @@ type execHandle struct {
 	executor        executor.Executor
 	isolationConfig *dstructs.IsolationConfig
 	userPid         int
-	allocDir        *allocdir.AllocDir
+	taskDir         *allocdir.TaskDir
 	killTimeout     time.Duration
 	maxKillTimeout  time.Duration
 	logger          *log.Logger
@@ -82,8 +78,22 @@ func (d *ExecDriver) Validate(config map[string]interface{}) error {
 	return nil
 }
 
+func (d *ExecDriver) Abilities() DriverAbilities {
+	return DriverAbilities{
+		SendSignals: true,
+	}
+}
+
+func (d *ExecDriver) FSIsolation() cstructs.FSIsolation {
+	return cstructs.FSIsolationChroot
+}
+
 func (d *ExecDriver) Periodic() (bool, time.Duration) {
 	return true, 15 * time.Second
+}
+
+func (d *ExecDriver) Prestart(ctx *ExecContext, task *structs.Task) error {
+	return nil
 }
 
 func (d *ExecDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
@@ -98,36 +108,22 @@ func (d *ExecDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 		return nil, err
 	}
 
-	// Set the host environment variables.
-	filter := strings.Split(d.config.ReadDefault("env.blacklist", config.DefaultEnvBlacklist), ",")
-	d.taskEnv.AppendHostEnvvars(filter)
-
-	// Get the task directory for storing the executor logs.
-	taskDir, ok := ctx.AllocDir.TaskDirs[d.DriverContext.taskName]
-	if !ok {
-		return nil, fmt.Errorf("Could not find task directory for task: %v", d.DriverContext.taskName)
+	pluginLogFile := filepath.Join(ctx.TaskDir.Dir, "executor.out")
+	executorConfig := &dstructs.ExecutorConfig{
+		LogFile:  pluginLogFile,
+		LogLevel: d.config.LogLevel,
 	}
-
-	bin, err := discover.NomadExecutable()
-	if err != nil {
-		return nil, fmt.Errorf("unable to find the nomad binary: %v", err)
-	}
-	pluginLogFile := filepath.Join(taskDir, fmt.Sprintf("%s-executor.out", task.Name))
-	pluginConfig := &plugin.ClientConfig{
-		Cmd: exec.Command(bin, "executor", pluginLogFile),
-	}
-
-	exec, pluginClient, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
+	exec, pluginClient, err := createExecutor(d.config.LogOutput, d.config, executorConfig)
 	if err != nil {
 		return nil, err
 	}
 	executorCtx := &executor.ExecutorContext{
-		TaskEnv:   d.taskEnv,
-		Driver:    "exec",
-		AllocDir:  ctx.AllocDir,
-		AllocID:   ctx.AllocID,
-		ChrootEnv: d.config.ChrootEnv,
-		Task:      task,
+		TaskEnv: d.taskEnv,
+		Driver:  "exec",
+		AllocID: ctx.AllocID,
+		LogDir:  ctx.TaskDir.LogDir,
+		TaskDir: ctx.TaskDir.Dir,
+		Task:    task,
 	}
 	if err := exec.SetContext(executorCtx); err != nil {
 		pluginClient.Kill()
@@ -156,7 +152,6 @@ func (d *ExecDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 		pluginClient:    pluginClient,
 		userPid:         ps.Pid,
 		executor:        exec,
-		allocDir:        ctx.AllocDir,
 		isolationConfig: ps.IsolationConfig,
 		killTimeout:     GetKillTimeout(task.KillTimeout, maxKill),
 		maxKillTimeout:  maxKill,
@@ -177,8 +172,6 @@ type execId struct {
 	KillTimeout     time.Duration
 	MaxKillTimeout  time.Duration
 	UserPid         int
-	TaskDir         string
-	AllocDir        *allocdir.AllocDir
 	IsolationConfig *dstructs.IsolationConfig
 	PluginConfig    *PluginReattachConfig
 }
@@ -192,7 +185,7 @@ func (d *ExecDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, erro
 	pluginConfig := &plugin.ClientConfig{
 		Reattach: id.PluginConfig.PluginConfig(),
 	}
-	exec, client, err := createExecutor(pluginConfig, d.config.LogOutput, d.config)
+	exec, client, err := createExecutorWithConfig(pluginConfig, d.config.LogOutput)
 	if err != nil {
 		merrs := new(multierror.Error)
 		merrs.Errors = append(merrs.Errors, err)
@@ -206,9 +199,6 @@ func (d *ExecDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, erro
 				merrs.Errors = append(merrs.Errors, fmt.Errorf("destroying cgroup failed: %v", e))
 			}
 		}
-		if e := ctx.AllocDir.UnmountAll(); e != nil {
-			merrs.Errors = append(merrs.Errors, e)
-		}
 		return nil, fmt.Errorf("error connecting to plugin: %v", merrs.ErrorOrNil())
 	}
 
@@ -219,7 +209,6 @@ func (d *ExecDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, erro
 		pluginClient:    client,
 		executor:        exec,
 		userPid:         id.UserPid,
-		allocDir:        id.AllocDir,
 		isolationConfig: id.IsolationConfig,
 		logger:          d.logger,
 		version:         id.Version,
@@ -242,7 +231,6 @@ func (h *execHandle) ID() string {
 		MaxKillTimeout:  h.maxKillTimeout,
 		PluginConfig:    NewPluginReattachConfig(h.pluginClient.ReattachConfig()),
 		UserPid:         h.userPid,
-		AllocDir:        h.allocDir,
 		IsolationConfig: h.isolationConfig,
 	}
 
@@ -280,17 +268,15 @@ func (h *execHandle) Kill() error {
 
 	select {
 	case <-h.doneCh:
-		return nil
 	case <-time.After(h.killTimeout):
 		if h.pluginClient.Exited() {
-			return nil
+			break
 		}
 		if err := h.executor.Exit(); err != nil {
 			return fmt.Errorf("executor Exit failed: %v", err)
 		}
-
-		return nil
 	}
+	return nil
 }
 
 func (h *execHandle) Stats() (*cstructs.TaskResourceUsage, error) {
@@ -298,7 +284,7 @@ func (h *execHandle) Stats() (*cstructs.TaskResourceUsage, error) {
 }
 
 func (h *execHandle) run() {
-	ps, err := h.executor.Wait()
+	ps, werr := h.executor.Wait()
 	close(h.doneCh)
 
 	// If the exitcode is 0 and we had an error that means the plugin didn't
@@ -306,26 +292,27 @@ func (h *execHandle) run() {
 	// the user process so that when we create a new executor on restarting the
 	// new user process doesn't have collisions with resources that the older
 	// user pid might be holding onto.
-	if ps.ExitCode == 0 && err != nil {
+	if ps.ExitCode == 0 && werr != nil {
 		if h.isolationConfig != nil {
 			ePid := h.pluginClient.ReattachConfig().Pid
 			if e := executor.ClientCleanup(h.isolationConfig, ePid); e != nil {
 				h.logger.Printf("[ERR] driver.exec: destroying resource container failed: %v", e)
 			}
 		}
-		if e := h.allocDir.UnmountAll(); e != nil {
-			h.logger.Printf("[ERR] driver.exec: unmounting dev,proc and alloc dirs failed: %v", e)
-		}
 	}
-	h.waitCh <- dstructs.NewWaitResult(ps.ExitCode, ps.Signal, err)
-	close(h.waitCh)
+
 	// Remove services
 	if err := h.executor.DeregisterServices(); err != nil {
 		h.logger.Printf("[ERR] driver.exec: failed to deregister services: %v", err)
 	}
 
+	// Exit the executor
 	if err := h.executor.Exit(); err != nil {
 		h.logger.Printf("[ERR] driver.exec: error destroying executor: %v", err)
 	}
 	h.pluginClient.Kill()
+
+	// Send the results
+	h.waitCh <- dstructs.NewWaitResult(ps.ExitCode, ps.Signal, werr)
+	close(h.waitCh)
 }

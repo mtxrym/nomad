@@ -11,7 +11,6 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/config"
-	"github.com/hashicorp/nomad/client/driver"
 	"github.com/hashicorp/nomad/client/vaultclient"
 	"github.com/hashicorp/nomad/nomad/structs"
 
@@ -26,10 +25,6 @@ const (
 	// update will transfer all past state information. If not other transition
 	// has occurred up to this limit, we will send to the server.
 	taskReceivedSyncLimit = 30 * time.Second
-
-	// watchdogInterval is the interval at which resource constraints for the
-	// allocation are being checked and enforced.
-	watchdogInterval = 5 * time.Second
 )
 
 // AllocStateUpdater is used to update the status of an allocation
@@ -52,8 +47,9 @@ type AllocRunner struct {
 
 	dirtyCh chan struct{}
 
-	ctx        *driver.ExecContext
-	ctxLock    sync.Mutex
+	allocDir     *allocdir.AllocDir
+	allocDirLock sync.Mutex
+
 	tasks      map[string]*TaskRunner
 	taskStates map[string]*structs.TaskState
 	restored   map[string]struct{}
@@ -80,9 +76,22 @@ type AllocRunner struct {
 type allocRunnerState struct {
 	Version                string
 	Alloc                  *structs.Allocation
+	AllocDir               *allocdir.AllocDir
 	AllocClientStatus      string
 	AllocClientDescription string
-	Context                *driver.ExecContext
+
+	// COMPAT: Remove in 0.7.0: removing will break upgrading directly from
+	//         0.5.2, so don't remove in the 0.6 series.
+	// Context is deprecated and only used to migrate from older releases.
+	// It will be removed in the future.
+	Context *struct {
+		AllocID  string // unused; included for completeness
+		AllocDir struct {
+			AllocDir  string
+			SharedDir string // unused; included for completeness
+			TaskDirs  map[string]string
+		}
+	} `json:"Context,omitempty"`
 }
 
 // NewAllocRunner is used to create a new allocation context
@@ -121,23 +130,34 @@ func (r *AllocRunner) RestoreState() error {
 		return err
 	}
 
+	// #2132 Upgrade path: if snap.AllocDir is nil, try to convert old
+	// Context struct to new AllocDir struct
+	if snap.AllocDir == nil && snap.Context != nil {
+		r.logger.Printf("[DEBUG] client: migrating state snapshot for alloc %q", r.alloc.ID)
+		snap.AllocDir = allocdir.NewAllocDir(r.logger, snap.Context.AllocDir.AllocDir)
+		for taskName := range snap.Context.AllocDir.TaskDirs {
+			snap.AllocDir.NewTaskDir(taskName)
+		}
+	}
+
 	// Restore fields
 	r.alloc = snap.Alloc
-	r.ctx = snap.Context
+	r.allocDir = snap.AllocDir
 	r.allocClientStatus = snap.AllocClientStatus
 	r.allocClientDescription = snap.AllocClientDescription
-	r.taskStates = snap.Alloc.TaskStates
 
 	var snapshotErrors multierror.Error
 	if r.alloc == nil {
 		snapshotErrors.Errors = append(snapshotErrors.Errors, fmt.Errorf("alloc_runner snapshot includes a nil allocation"))
 	}
-	if r.ctx == nil {
-		snapshotErrors.Errors = append(snapshotErrors.Errors, fmt.Errorf("alloc_runner snapshot includes a nil context"))
+	if r.allocDir == nil {
+		snapshotErrors.Errors = append(snapshotErrors.Errors, fmt.Errorf("alloc_runner snapshot includes a nil alloc dir"))
 	}
 	if e := snapshotErrors.ErrorOrNil(); e != nil {
 		return e
 	}
+
+	r.taskStates = snap.Alloc.TaskStates
 
 	// Restore the task runners
 	var mErr multierror.Error
@@ -145,9 +165,16 @@ func (r *AllocRunner) RestoreState() error {
 		// Mark the task as restored.
 		r.restored[name] = struct{}{}
 
+		td, ok := r.allocDir.TaskDirs[name]
+		if !ok {
+			err := fmt.Errorf("failed to find task dir metadata for alloc %q task %q",
+				r.alloc.ID, name)
+			r.logger.Printf("[ERR] client: %v", err)
+			return err
+		}
+
 		task := &structs.Task{Name: name}
-		tr := NewTaskRunner(r.logger, r.config, r.setTaskState, r.ctx, r.Alloc(),
-			task, r.vaultClient)
+		tr := NewTaskRunner(r.logger, r.config, r.setTaskState, td, r.Alloc(), task, r.vaultClient)
 		r.tasks[name] = tr
 
 		// Skip tasks in terminal states.
@@ -169,10 +196,7 @@ func (r *AllocRunner) RestoreState() error {
 
 // GetAllocDir returns the alloc dir for the alloc runner
 func (r *AllocRunner) GetAllocDir() *allocdir.AllocDir {
-	if r.ctx == nil {
-		return nil
-	}
-	return r.ctx.AllocDir
+	return r.allocDir
 }
 
 // SaveState is used to snapshot the state of the alloc runner
@@ -207,14 +231,14 @@ func (r *AllocRunner) saveAllocRunnerState() error {
 	allocClientDescription := r.allocClientDescription
 	r.allocLock.Unlock()
 
-	r.ctxLock.Lock()
-	ctx := r.ctx
-	r.ctxLock.Unlock()
+	r.allocDirLock.Lock()
+	allocDir := r.allocDir
+	r.allocDirLock.Unlock()
 
 	snap := allocRunnerState{
 		Version:                r.config.Version,
 		Alloc:                  alloc,
-		Context:                ctx,
+		AllocDir:               allocDir,
 		AllocClientStatus:      allocClientStatus,
 		AllocClientDescription: allocClientDescription,
 	}
@@ -236,7 +260,7 @@ func (r *AllocRunner) DestroyState() error {
 
 // DestroyContext is used to destroy the context
 func (r *AllocRunner) DestroyContext() error {
-	return r.ctx.AllocDir.Destroy()
+	return r.allocDir.Destroy()
 }
 
 // copyTaskStates returns a copy of the passed task states.
@@ -279,7 +303,7 @@ func (r *AllocRunner) Alloc() *structs.Allocation {
 		case structs.TaskStatePending:
 			pending = true
 		case structs.TaskStateDead:
-			if state.Failed() {
+			if state.Failed {
 				failed = true
 			} else {
 				dead = true
@@ -334,7 +358,8 @@ func (r *AllocRunner) setStatus(status, desc string) {
 	}
 }
 
-// setTaskState is used to set the status of a task
+// setTaskState is used to set the status of a task. If state is empty then the
+// event is appended but not synced with the server. The event may be omitted
 func (r *AllocRunner) setTaskState(taskName, state string, event *structs.TaskEvent) {
 	r.taskStatusLock.Lock()
 	defer r.taskStatusLock.Unlock()
@@ -345,12 +370,21 @@ func (r *AllocRunner) setTaskState(taskName, state string, event *structs.TaskEv
 	}
 
 	// Set the tasks state.
-	taskState.State = state
-	r.appendTaskEvent(taskState, event)
+	if event != nil {
+		if event.FailsTask {
+			taskState.Failed = true
+		}
+		r.appendTaskEvent(taskState, event)
+	}
 
+	if state == "" {
+		return
+	}
+
+	taskState.State = state
 	if state == structs.TaskStateDead {
 		// If the task failed, we should kill all the other tasks in the task group.
-		if taskState.Failed() {
+		if taskState.Failed {
 			var destroyingTasks []string
 			for task, tr := range r.tasks {
 				if task != taskName {
@@ -402,18 +436,19 @@ func (r *AllocRunner) Run() {
 	}
 
 	// Create the execution context
-	r.ctxLock.Lock()
-	if r.ctx == nil {
-		allocDir := allocdir.NewAllocDir(filepath.Join(r.config.AllocDir, r.alloc.ID), r.Alloc().Resources.DiskMB)
-		if err := allocDir.Build(tg.Tasks); err != nil {
+	r.allocDirLock.Lock()
+	if r.allocDir == nil {
+		// Build allocation directory
+		r.allocDir = allocdir.NewAllocDir(r.logger, filepath.Join(r.config.AllocDir, r.alloc.ID))
+		if err := r.allocDir.Build(); err != nil {
 			r.logger.Printf("[WARN] client: failed to build task directories: %v", err)
 			r.setStatus(structs.AllocClientStatusFailed, fmt.Sprintf("failed to build task dirs for '%s'", alloc.TaskGroup))
-			r.ctxLock.Unlock()
+			r.allocDirLock.Unlock()
 			return
 		}
-		r.ctx = driver.NewExecContext(allocDir, r.alloc.ID)
+
 		if r.otherAllocDir != nil {
-			if err := allocDir.Move(r.otherAllocDir, tg.Tasks); err != nil {
+			if err := r.allocDir.Move(r.otherAllocDir, tg.Tasks); err != nil {
 				r.logger.Printf("[ERROR] client: failed to move alloc dir into alloc %q: %v", r.alloc.ID, err)
 			}
 			if err := r.otherAllocDir.Destroy(); err != nil {
@@ -421,7 +456,7 @@ func (r *AllocRunner) Run() {
 			}
 		}
 	}
-	r.ctxLock.Unlock()
+	r.allocDirLock.Unlock()
 
 	// Check if the allocation is in a terminal status. In this case, we don't
 	// start any of the task runners and directly wait for the destroy signal to
@@ -441,19 +476,17 @@ func (r *AllocRunner) Run() {
 			continue
 		}
 
-		tr := NewTaskRunner(r.logger, r.config, r.setTaskState, r.ctx, r.Alloc(), task.Copy(), r.vaultClient)
+		r.allocDirLock.Lock()
+		taskdir := r.allocDir.NewTaskDir(task.Name)
+		r.allocDirLock.Unlock()
+
+		tr := NewTaskRunner(r.logger, r.config, r.setTaskState, taskdir, r.Alloc(), task.Copy(), r.vaultClient)
 		r.tasks[task.Name] = tr
 		tr.MarkReceived()
 
 		go tr.Run()
 	}
 	r.taskLock.Unlock()
-
-	// Start watching the shared allocation directory for disk usage
-	go r.ctx.AllocDir.StartDiskWatcher()
-
-	watchdog := time.NewTicker(watchdogInterval)
-	defer watchdog.Stop()
 
 	// taskDestroyEvent contains an event that caused the destroyment of a task
 	// in the allocation.
@@ -480,12 +513,6 @@ OUTER:
 			for _, tr := range runners {
 				tr.Update(update)
 			}
-		case <-watchdog.C:
-			if event, desc := r.checkResources(); event != nil {
-				r.setStatus(structs.AllocClientStatusFailed, desc)
-				taskDestroyEvent = event
-				break OUTER
-			}
 		case <-r.destroyCh:
 			taskDestroyEvent = structs.NewTaskEvent(structs.TaskKilled)
 			break OUTER
@@ -494,9 +521,6 @@ OUTER:
 
 	// Kill the task runners
 	r.destroyTaskRunners(taskDestroyEvent)
-
-	// Stop watching the shared allocation directory
-	r.ctx.AllocDir.StopDiskWatcher()
 
 	// Block until we should destroy the state of the alloc
 	r.handleDestroy()
@@ -525,18 +549,6 @@ func (r *AllocRunner) destroyTaskRunners(destroyEvent *structs.TaskEvent) {
 
 	// Final state sync
 	r.syncStatus()
-}
-
-// checkResources monitors and enforces alloc resource usage. It returns an
-// appropriate task event describing why the allocation had to be killed.
-func (r *AllocRunner) checkResources() (*structs.TaskEvent, string) {
-	diskSize := r.ctx.AllocDir.GetSize()
-	diskLimit := r.Alloc().Resources.DiskInBytes()
-	if diskSize > diskLimit {
-		return structs.NewTaskEvent(structs.TaskDiskExceeded).SetDiskLimit(diskLimit).SetDiskSize(diskSize),
-			"shared allocation directory exceeded the allowed disk space"
-	}
-	return nil, ""
 }
 
 // handleDestroy blocks till the AllocRunner should be destroyed and does the

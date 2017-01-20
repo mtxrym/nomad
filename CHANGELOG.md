@@ -1,37 +1,156 @@
-## 0.5.0 (Unreleased)
+## 0.5.3 (Unreleased) 
+
+__BACKWARDS INCOMPATIBILITIES:__
+  * Client must be run as user with ability to call mount syscall
 
 IMPROVEMENTS:
-  * core: Introduce node SecretID which can be used to minimize the available
-    surface area of RPCs to malicious Nomad Clients [GH-1597] 
-  * agent: Add DataDog telemetry sync [GH-1816]
-  * cli: `nomad alloc-status` shows allocation creation time [GH-1623]
-  * client: Failed RPCs are retried on all servers [GH-1735]
-  * client: Enforce shared allocation directory disk usage [GH-1580]
-  * client: Introduce a `secrets/` directory to tasks where sensitive data can
-    be written [GH-1681]
-  * driver: Export `NOMAD_JOB_NAME` environment variable [GH-1804]
-  * driver/docker: Support Docker volumes [GH-1767]
-  * driver/docker: Allow Docker logging to be configured [GH-1767]
+  * core: Introduce Constructor jobs and Dispatch command/API [GH-2128]
+  * core: Cancel blocked evals upon successful one for job [GH-2155]
+  * cli: Defaulting to showing allocations which belong to currently registered
+    job [GH-2032]
+  * client: Garbage collect Allocation Runners to free up disk resouces
+    [GH-2081]
+  * client: Fixed namespacing for the cpu arch attribute [GH-2161]
+  * client: Don't retrieve Driver Stats if unsupported [GH-2173]
+  * driver/docker: Add support for network aliases [GH-1980]
+  * driver/docker: Add `force_pull` option to force downloading an image [GH-2147]
+  * driver/java: Support setting class_path and class name. [GH-2199]
+  * telemetry: Prefix gauge values with node name instead of hostname [GH-2098]
 
 BUG FIXES:
+  * client: Fix issue where allocations weren't pulled for several minutes. This
+    manifested as slow starts, delayed kills, etc [GH-2177]
+  * driver/docker: Fix Docker auth/logging interprelation [GH-2063, GH-2130]
+
+## 0.5.2 (December 23, 2016)
+
+BUG FIXES:
+  * client: Fixed a race condition and remove panic when handling duplicate
+    allocations [GH-2096]
+  * client: Cancel wait for remote allocation if migration is no longer required
+    [GH-2097]
+  * client: Failure to stat a single mountpoint does not cause all of host
+    resource usage collection to fail [GH-2090]
+
+## 0.5.1 (December 12, 2016)
+
+IMPROVEMENTS:
+  * driver/rkt: Support rkt's `--dns=host` and `--dns=none` options [GH-2028]
+
+BUG FIXES:
+  * agent/config: Fix use of IPv6 addresses [GH-2036]
+  * api: Fix file descriptor leak and high CPU usage when using the logs
+    endpoint [GH-2079]
+  * cli: Improve parsing error when a job without a name is specified [GH-2030]
+  * client: Fixed permissions of migrated allocation directory [GH-2061]
+  * client: Ensuring allocations are not blocked more than once [GH-2040]
+  * client: Fix race on StreamFramer Destroy which would cause a panic [GH-2007]
+  * client: Not migrating allocation directories on the same client if sticky is
+    turned off [GH-2017]
+  * client/vault: Fix issue in which deriving a Vault token would fail with
+    allocation does not exist due to stale queries [GH-2050]
+  * driver/docker: Make container exist errors non-retriable by task runner
+    [GH-2033]
+  * driver/docker: Fixed an issue related to purging containers with same name
+    as Nomad is trying to start [GH-2037]
+  * driver/rkt: Fix validation of rkt volumes [GH-2027]
+
+## 0.5.0 (November 16, 2016)
+
+__BACKWARDS INCOMPATIBILITIES:__
+  * jobspec: Extracted the disk resources from the task to the task group. The
+    new block is name `ephemeral_disk`. Nomad will automatically convert
+    existing jobs but newly submitted jobs should refactor the disk resource
+    [GH-1710, GH-1679]
+  * agent/config: `network_speed` is now an override and not a default value. If
+    the network link speed is not detected a default value is applied.
+
+IMPROVEMENTS:
+  * core: Support for gossip encryption [GH-1791]
+  * core: Vault integration to handle secure introduction of tasks [GH-1583,
+    GH-1713]
+  * core: New `set_contains` constraint to determine if a set contains all
+    specified values [GH-1839]
+  * core: Scheduler version enforcement disallows different scheduler version
+    from making decisions simultaneously [GH-1872]
+  * core: Introduce node SecretID which can be used to minimize the available
+    surface area of RPCs to malicious Nomad Clients [GH-1597] 
+  * core: Add `sticky` volumes which inform the scheduler to prefer placing
+    updated allocations on the same node and to reuse the `local/` and
+    `alloc/data` directory from previous allocation allowing semi-persistent
+    data and allow those folders to be synced from a remote node [GH-1654,
+    GH-1741]
+  * agent: Add DataDog telemetry sync [GH-1816]
+  * agent: Allow Consul health checks to use bind address rather than advertise
+    [GH-1866]
+  * agent/config: Advertise addresses do not need to specify a port [GH-1902]
+  * agent/config: Bind address defaults to 0.0.0.0 and Advertise defaults to
+    hostname [GH-1955]
+  * api: Support TLS for encrypting Raft, RPC and HTTP APIs [GH-1853]
+  * api: Implement blocking queries for querying a job's evaluations [GH-1892]
+  * cli: `nomad alloc-status` shows allocation creation time [GH-1623]
+  * cli: `nomad node-status` shows node metadata in verbose mode [GH-1841]
+  * client: Failed RPCs are retried on all servers [GH-1735]
+  * client: Fingerprint and driver blacklist support [GH-1949]
+  * client: Introduce a `secrets/` directory to tasks where sensitive data can
+    be written [GH-1681]
+  * client/jobspec: Add support for templates that can render static files,
+    dynamic content from Consul and secrets from Vault [GH-1783]
+  * driver: Export `NOMAD_JOB_NAME` environment variable [GH-1804]
+  * driver/docker: Docker For Mac support [GH-1806]
+  * driver/docker: Support Docker volumes [GH-1767]
+  * driver/docker: Allow Docker logging to be configured [GH-1767]
+  * driver/docker: Add `userns_mode` (`--userns`) support [GH-1940]
+  * driver/lxc: Support for LXC containers [GH-1699]
+  * driver/rkt: Support network configurations [GH-1862]
+  * driver/rkt: Support rkt volumes (rkt >= 1.0.0 required) [GH-1812]
+  * server/rpc: Added an RPC endpoint for retreiving server members [GH-1947]
+
+BUG FIXES:
+  * core: Fix case where dead nodes were not properly handled by System
+    scheduler [GH-1715]
   * agent: Handle the SIGPIPE signal preventing panics on journalctl restarts
     [GH-1802]
+  * api: Disallow filesystem APIs to read paths that escape the allocation
+    directory [GH-1786]
+  * cli: `nomad run` failed to run on Windows [GH-1690]
+  * cli: `alloc-status` and `node-status` work without access to task stats
+    [GH-1660]
+  * cli: `alloc-status` does not query for allocation statistics if node is down
+    [GH-1844]
   * client: Prevent race when persisting state file [GH-1682]
+  * client: Retry recoverable errors when starting a driver [GH-1891]
+  * client: Do not validate the command does not contain spaces [GH-1974]
+  * client: Fix old services not getting removed from consul on update [GH-1668]
+  * client: Preserve permissions of nested directories while chrooting [GH-1960]
+  * client: Folder permissions are dropped even when not running as root [GH-1888]
   * client: Artifact download failures will be retried before failing tasks
     [GH-1558]
-  * client: Fix a crash related to stats publishing when driver hasn't started
-    yet [GH-1723]
   * client: Fix a memory leak in the executor that caused failed allocations
     [GH-1762]
-  * client: Fix old services not getting removed from consul on update [GH-1668]
+  * client: Fix a crash related to stats publishing when driver hasn't started
+    yet [GH-1723]
+  * client: Chroot environment is only created once, avoid potential filesystem
+    errors [GH-1753]
+  * client: Failures to download an artifact are retried according to restart
+    policy before failing the allocation [GH-1653]
+  * client/executor: Prevent race when updating a job configuration with the
+    logger [GH-1886]
   * client/fingerprint: Fix inconsistent CPU MHz fingerprinting [GH-1366]
+  * env/aws: Fix an issue with reserved ports causing placement failures
+    [GH-1617] 
+  * discovery: Interpolate all service and check fields [GH-1966]
   * discovery: Fix old services not getting removed from Consul on update
     [GH-1668]
   * discovery: Fix HTTP timeout with Server HTTP health check when there is no
     leader [GH-1656]
   * discovery: Fix client flapping when server is in a different datacenter as
     the client [GH-1641]
+  * discovery/jobspec: Validate service name after interpolation [GH-1852]
   * driver/docker: Fix `local/` directory mount into container [GH-1830]
+  * driver/docker: Interpolate all string configuration variables [GH-1965]
+  * jobspec: Tasks without a resource block no longer fail to validate [GH-1864]
+  * jobspec: Update HCL to fix panic in JSON parsing [GH-1754]
 
 ## 0.4.1 (August 18, 2016)
 
@@ -254,7 +373,7 @@ BUG FIXES:
     [GH-906]
   * consul: Remove concurrent map access [GH-874]
   * driver/exec: Stopping tasks with more than one pid in a cgroup [GH-855]
-  * executor/linux: Add /run/resolvconf/ to chroot so DNS works [GH-905]
+  * client/executor/linux: Add /run/resolvconf/ to chroot so DNS works [GH-905]
 
 ## 0.3.0 (February 25, 2016)
 

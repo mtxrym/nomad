@@ -6,11 +6,11 @@ VAGRANTFILE_API_VERSION = "2"
 
 DEFAULT_CPU_COUNT = 2
 $script = <<SCRIPT
-GO_VERSION="1.7.1"
+GO_VERSION="1.7.4"
 
 # Install Prereq Packages
 sudo apt-get update
-sudo apt-get install -y build-essential curl git-core mercurial bzr libpcre3-dev pkg-config zip default-jre qemu libc6-dev-i386 silversearcher-ag jq htop vim unzip
+sudo apt-get install -y build-essential curl git-core mercurial bzr libpcre3-dev pkg-config zip default-jre qemu libc6-dev-i386 silversearcher-ag jq htop vim unzip liblxc1 lxc-dev
 
 # Setup go, for development of Nomad
 SRCROOT="/opt/go"
@@ -60,8 +60,12 @@ cd /opt/gopath/src/github.com/hashicorp/nomad && make bootstrap
 
 # Install rkt, consul and vault
 bash scripts/install_rkt.sh
+bash scripts/install_rkt_vagrant.sh
 bash scripts/install_consul.sh
 bash scripts/install_vault.sh
+
+# Set hostname's IP to made advertisement Just Work
+sudo sed -i -e "s/.*nomad.*/$(ip route get 1 | awk '{print $NF;exit}') $(hostname)/" /etc/hosts
 
 # CD into the nomad working directory when we login to the VM
 grep "cd /opt/gopath/src/github.com/hashicorp/nomad" ~/.profile || echo "cd /opt/gopath/src/github.com/hashicorp/nomad" >> ~/.profile

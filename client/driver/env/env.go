@@ -2,6 +2,7 @@ package env
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -21,9 +22,9 @@ const (
 	// removed.
 	TaskLocalDir = "NOMAD_TASK_DIR"
 
-	// SecretDir is the environment variable with the path to the tasks secret
+	// SecretsDir is the environment variable with the path to the tasks secret
 	// directory where it can store sensitive data.
-	SecretDir = "NOMAD_SECRET_DIR"
+	SecretsDir = "NOMAD_SECRETS_DIR"
 
 	// MemLimit is the environment variable with the tasks memory limit in MBs.
 	MemLimit = "NOMAD_MEMORY_LIMIT"
@@ -85,11 +86,9 @@ const (
 type TaskEnvironment struct {
 	Env              map[string]string
 	TaskMeta         map[string]string
-	TaskGroupMeta    map[string]string
-	JobMeta          map[string]string
 	AllocDir         string
 	TaskDir          string
-	SecretDir        string
+	SecretsDir       string
 	CpuLimit         int
 	MemLimit         int
 	TaskName         string
@@ -138,11 +137,9 @@ func (t *TaskEnvironment) Build() *TaskEnvironment {
 	t.NodeValues = make(map[string]string)
 	t.TaskEnv = make(map[string]string)
 
-	// Build the meta with the following precedence: task, task group, job.
-	for _, meta := range []map[string]string{t.JobMeta, t.TaskGroupMeta, t.TaskMeta} {
-		for k, v := range meta {
-			t.TaskEnv[fmt.Sprintf("%s%s", MetaPrefix, strings.ToUpper(k))] = v
-		}
+	// Build the meta
+	for k, v := range t.TaskMeta {
+		t.TaskEnv[fmt.Sprintf("%s%s", MetaPrefix, strings.ToUpper(k))] = v
 	}
 
 	// Build the ports
@@ -153,8 +150,8 @@ func (t *TaskEnvironment) Build() *TaskEnvironment {
 			if forwardedPort, ok := t.PortMap[label]; ok {
 				value = forwardedPort
 			}
-			t.TaskEnv[fmt.Sprintf("%s%s", PortPrefix, label)] = fmt.Sprintf("%d", value)
-			IPPort := fmt.Sprintf("%s:%d", network.IP, value)
+			t.TaskEnv[fmt.Sprintf("%s%s", PortPrefix, label)] = strconv.Itoa(value)
+			IPPort := net.JoinHostPort(network.IP, strconv.Itoa(value))
 			t.TaskEnv[fmt.Sprintf("%s%s", AddrPrefix, label)] = IPPort
 
 		}
@@ -167,8 +164,8 @@ func (t *TaskEnvironment) Build() *TaskEnvironment {
 	if t.TaskDir != "" {
 		t.TaskEnv[TaskLocalDir] = t.TaskDir
 	}
-	if t.SecretDir != "" {
-		t.TaskEnv[SecretDir] = t.SecretDir
+	if t.SecretsDir != "" {
+		t.TaskEnv[SecretsDir] = t.SecretsDir
 	}
 
 	// Build the resource limits
@@ -274,13 +271,13 @@ func (t *TaskEnvironment) ClearTaskLocalDir() *TaskEnvironment {
 	return t
 }
 
-func (t *TaskEnvironment) SetSecretDir(dir string) *TaskEnvironment {
-	t.SecretDir = dir
+func (t *TaskEnvironment) SetSecretsDir(dir string) *TaskEnvironment {
+	t.SecretsDir = dir
 	return t
 }
 
-func (t *TaskEnvironment) ClearSecretDir() *TaskEnvironment {
-	t.SecretDir = ""
+func (t *TaskEnvironment) ClearSecretsDir() *TaskEnvironment {
+	t.SecretsDir = ""
 	return t
 }
 
@@ -333,26 +330,6 @@ func (t *TaskEnvironment) SetTaskMeta(m map[string]string) *TaskEnvironment {
 
 func (t *TaskEnvironment) ClearTaskMeta() *TaskEnvironment {
 	t.TaskMeta = nil
-	return t
-}
-
-func (t *TaskEnvironment) SetTaskGroupMeta(m map[string]string) *TaskEnvironment {
-	t.TaskGroupMeta = m
-	return t
-}
-
-func (t *TaskEnvironment) ClearTaskGroupMeta() *TaskEnvironment {
-	t.TaskGroupMeta = nil
-	return t
-}
-
-func (t *TaskEnvironment) SetJobMeta(m map[string]string) *TaskEnvironment {
-	t.JobMeta = m
-	return t
-}
-
-func (t *TaskEnvironment) ClearJobMeta() *TaskEnvironment {
-	t.JobMeta = nil
 	return t
 }
 

@@ -283,6 +283,25 @@ func TestParse(t *testing.T) {
 		},
 
 		{
+			"set-contains-constraint.hcl",
+			&structs.Job{
+				ID:       "foo",
+				Name:     "foo",
+				Priority: 50,
+				Region:   "global",
+				Type:     "service",
+				Constraints: []*structs.Constraint{
+					&structs.Constraint{
+						LTarget: "$meta.data",
+						RTarget: "foo,bar,baz",
+						Operand: structs.ConstraintSetContains,
+					},
+				},
+			},
+			false,
+		},
+
+		{
 			"distinctHosts-constraint.hcl",
 			&structs.Job{
 				ID:       "foo",
@@ -510,6 +529,50 @@ func TestParse(t *testing.T) {
 									Policies:   []string{"job"},
 									Env:        true,
 									ChangeMode: structs.VaultChangeModeRestart,
+								},
+							},
+						},
+					},
+				},
+			},
+			false,
+		},
+
+		{
+			"constructor.hcl",
+			&structs.Job{
+				ID:       "constructor",
+				Name:     "constructor",
+				Type:     "service",
+				Priority: 50,
+				Region:   "global",
+
+				Constructor: &structs.ConstructorConfig{
+					Payload:      "required",
+					MetaRequired: []string{"foo", "bar"},
+					MetaOptional: []string{"baz", "bam"},
+				},
+
+				TaskGroups: []*structs.TaskGroup{
+					&structs.TaskGroup{
+						Name:          "foo",
+						Count:         1,
+						EphemeralDisk: structs.DefaultEphemeralDisk(),
+						Tasks: []*structs.Task{
+							&structs.Task{
+								Name:   "bar",
+								Driver: "docker",
+								Resources: &structs.Resources{
+									CPU:      100,
+									MemoryMB: 10,
+									IOPS:     0,
+								},
+								LogConfig: &structs.LogConfig{
+									MaxFiles:      10,
+									MaxFileSizeMB: 10,
+								},
+								DispatchInput: &structs.DispatchInputConfig{
+									File: "foo/bar",
 								},
 							},
 						},

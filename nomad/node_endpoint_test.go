@@ -77,7 +77,7 @@ func TestClientEndpoint_Register_NoSecret(t *testing.T) {
 	// Update the node to be pre-0.5
 	node.Attributes["nomad.version"] = "0.4.1"
 	if err := msgpackrpc.CallWithCodec(codec, "Node.Register", req, &resp); err != nil {
-		t.Fatalf("Expecting error regarding missing secret id", err)
+		t.Fatalf("Not expecting err: %v", err)
 	}
 	if resp.Index == 0 {
 		t.Fatalf("bad index: %d", resp.Index)
@@ -683,11 +683,11 @@ func TestClientEndpoint_Drain_Down(t *testing.T) {
 
 	// Wait for the scheduler to create an allocation
 	testutil.WaitForResult(func() (bool, error) {
-		allocs, err := s1.fsm.state.AllocsByJob(job.ID)
+		allocs, err := s1.fsm.state.AllocsByJob(job.ID, true)
 		if err != nil {
 			return false, err
 		}
-		allocs1, err := s1.fsm.state.AllocsByJob(job1.ID)
+		allocs1, err := s1.fsm.state.AllocsByJob(job1.ID, true)
 		if err != nil {
 			return false, err
 		}
@@ -731,6 +731,7 @@ func TestClientEndpoint_Drain_Down(t *testing.T) {
 					Lost:   1,
 				},
 			},
+			Children:    new(structs.JobChildrenSummary),
 			CreateIndex: jobResp.JobModifyIndex,
 			ModifyIndex: summary.ModifyIndex,
 		}
@@ -749,6 +750,7 @@ func TestClientEndpoint_Drain_Down(t *testing.T) {
 					Lost: 1,
 				},
 			},
+			Children:    new(structs.JobChildrenSummary),
 			CreateIndex: jobResp1.JobModifyIndex,
 			ModifyIndex: summary1.ModifyIndex,
 		}
@@ -1822,18 +1824,23 @@ func TestClientEndpoint_DeriveVaultToken_Bad(t *testing.T) {
 	}
 
 	var resp structs.DeriveVaultTokenResponse
-	err := msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp)
-	if err == nil || !strings.Contains(err.Error(), "SecretID mismatch") {
-		t.Fatalf("Expected SecretID mismatch: %v", err)
+	if err := msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp); err != nil {
+		t.Fatalf("bad: %v", err)
+	}
+
+	if resp.Error == nil || !strings.Contains(resp.Error.Error(), "SecretID mismatch") {
+		t.Fatalf("Expected SecretID mismatch: %v", resp.Error)
 	}
 
 	// Put the correct SecretID
 	req.SecretID = node.SecretID
 
 	// Now we should get an error about the allocation not running on the node
-	err = msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp)
-	if err == nil || !strings.Contains(err.Error(), "not running on Node") {
-		t.Fatalf("Expected not running on node error: %v", err)
+	if err := msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp); err != nil {
+		t.Fatalf("bad: %v", err)
+	}
+	if resp.Error == nil || !strings.Contains(resp.Error.Error(), "not running on Node") {
+		t.Fatalf("Expected not running on node error: %v", resp.Error)
 	}
 
 	// Update to be running on the node
@@ -1843,9 +1850,11 @@ func TestClientEndpoint_DeriveVaultToken_Bad(t *testing.T) {
 	}
 
 	// Now we should get an error about the job not needing any Vault secrets
-	err = msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp)
-	if err == nil || !strings.Contains(err.Error(), "does not require") {
-		t.Fatalf("Expected no policies error: %v", err)
+	if err := msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp); err != nil {
+		t.Fatalf("bad: %v", err)
+	}
+	if resp.Error == nil || !strings.Contains(resp.Error.Error(), "does not require") {
+		t.Fatalf("Expected no policies error: %v", resp.Error)
 	}
 
 	// Update to be terminal
@@ -1855,9 +1864,11 @@ func TestClientEndpoint_DeriveVaultToken_Bad(t *testing.T) {
 	}
 
 	// Now we should get an error about the job not needing any Vault secrets
-	err = msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp)
-	if err == nil || !strings.Contains(err.Error(), "terminal") {
-		t.Fatalf("Expected terminal allocation error: %v", err)
+	if err := msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp); err != nil {
+		t.Fatalf("bad: %v", err)
+	}
+	if resp.Error == nil || !strings.Contains(resp.Error.Error(), "terminal") {
+		t.Fatalf("Expected terminal allocation error: %v", resp.Error)
 	}
 }
 
@@ -1920,6 +1931,9 @@ func TestClientEndpoint_DeriveVaultToken(t *testing.T) {
 	if err := msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp); err != nil {
 		t.Fatalf("bad: %v", err)
 	}
+	if resp.Error != nil {
+		t.Fatalf("bad: %v", resp.Error)
+	}
 
 	// Check the state store and ensure that we created a VaultAccessor
 	va, err := state.VaultAccessor(accessor)
@@ -1945,5 +1959,61 @@ func TestClientEndpoint_DeriveVaultToken(t *testing.T) {
 
 	if !reflect.DeepEqual(expected, va) {
 		t.Fatalf("Got %#v; want %#v", va, expected)
+	}
+}
+
+func TestClientEndpoint_DeriveVaultToken_VaultError(t *testing.T) {
+	s1 := testServer(t, nil)
+	defer s1.Shutdown()
+	state := s1.fsm.State()
+	codec := rpcClient(t, s1)
+	testutil.WaitForLeader(t, s1.RPC)
+
+	// Enable vault and allow authenticated
+	tr := true
+	s1.config.VaultConfig.Enabled = &tr
+	s1.config.VaultConfig.AllowUnauthenticated = &tr
+
+	// Replace the Vault Client on the server
+	tvc := &TestVaultClient{}
+	s1.vault = tvc
+
+	// Create the node
+	node := mock.Node()
+	if err := state.UpsertNode(2, node); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Create an alloc an allocation that has vault policies required
+	alloc := mock.Alloc()
+	alloc.NodeID = node.ID
+	task := alloc.Job.TaskGroups[0].Tasks[0]
+	tasks := []string{task.Name}
+	task.Vault = &structs.Vault{Policies: []string{"a", "b"}}
+	if err := state.UpsertAllocs(3, []*structs.Allocation{alloc}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Return an error when creating the token
+	tvc.SetCreateTokenError(alloc.ID, task.Name,
+		structs.NewRecoverableError(fmt.Errorf("recover"), true))
+
+	req := &structs.DeriveVaultTokenRequest{
+		NodeID:   node.ID,
+		SecretID: node.SecretID,
+		AllocID:  alloc.ID,
+		Tasks:    tasks,
+		QueryOptions: structs.QueryOptions{
+			Region: "global",
+		},
+	}
+
+	var resp structs.DeriveVaultTokenResponse
+	err := msgpackrpc.CallWithCodec(codec, "Node.DeriveVaultToken", req, &resp)
+	if err != nil {
+		t.Fatalf("bad: %v", err)
+	}
+	if resp.Error == nil || !resp.Error.Recoverable {
+		t.Fatalf("bad: %+v", resp.Error)
 	}
 }

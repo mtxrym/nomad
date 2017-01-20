@@ -94,19 +94,17 @@ type ExecutorContext struct {
 	// TaskEnv holds information about the environment of a Task
 	TaskEnv *env.TaskEnvironment
 
-	// AllocDir is the handle to do operations on the alloc dir of
-	// the task
-	AllocDir *allocdir.AllocDir
-
 	// Task is the task whose executor is being launched
 	Task *structs.Task
 
 	// AllocID is the allocation id to which the task belongs
 	AllocID string
 
-	// A mapping of directories on the host OS to attempt to embed inside each
-	// task's chroot.
-	ChrootEnv map[string]string
+	// TaskDir is the host path to the task's root
+	TaskDir string
+
+	// LogDir is the host path where logs should be written
+	LogDir string
 
 	// Driver is the name of the driver that invoked the executor
 	Driver string
@@ -183,7 +181,6 @@ type UniversalExecutor struct {
 
 	pids                map[int]*nomadPid
 	pidLock             sync.RWMutex
-	taskDir             string
 	exitState           *ProcessState
 	processExited       chan interface{}
 	fsIsolationEnforced bool
@@ -258,10 +255,8 @@ func (e *UniversalExecutor) LaunchCmd(command *ExecCommand) (*ProcessState, erro
 		}
 	}
 
-	// configuring the task dir
-	if err := e.configureTaskDir(); err != nil {
-		return nil, err
-	}
+	// set the task dir as the working directory for the command
+	e.cmd.Dir = e.ctx.TaskDir
 
 	e.ctx.TaskEnv.Build()
 	// configuring the chroot, resource container, and start the plugin
@@ -298,9 +293,9 @@ func (e *UniversalExecutor) LaunchCmd(command *ExecCommand) (*ProcessState, erro
 
 	// Determine the path to run as it may have to be relative to the chroot.
 	if e.fsIsolationEnforced {
-		rel, err := filepath.Rel(e.taskDir, path)
+		rel, err := filepath.Rel(e.ctx.TaskDir, path)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to determine relative path base=%q target=%q: %v", e.ctx.TaskDir, path, err)
 		}
 		path = rel
 	}
@@ -312,7 +307,7 @@ func (e *UniversalExecutor) LaunchCmd(command *ExecCommand) (*ProcessState, erro
 
 	// Start the process
 	if err := e.cmd.Start(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to start command path=%q --- args=%q: %v", path, e.cmd.Args, err)
 	}
 	go e.collectPids()
 	go e.wait()
@@ -327,19 +322,19 @@ func (e *UniversalExecutor) configureLoggers() error {
 
 	logFileSize := int64(e.ctx.Task.LogConfig.MaxFileSizeMB * 1024 * 1024)
 	if e.lro == nil {
-		lro, err := logging.NewFileRotator(e.ctx.AllocDir.LogDir(), fmt.Sprintf("%v.stdout", e.ctx.Task.Name),
+		lro, err := logging.NewFileRotator(e.ctx.LogDir, fmt.Sprintf("%v.stdout", e.ctx.Task.Name),
 			e.ctx.Task.LogConfig.MaxFiles, logFileSize, e.logger)
 		if err != nil {
-			return err
+			return fmt.Errorf("error creating new stdout log file for %q: %v", e.ctx.Task.Name, err)
 		}
 		e.lro = lro
 	}
 
 	if e.lre == nil {
-		lre, err := logging.NewFileRotator(e.ctx.AllocDir.LogDir(), fmt.Sprintf("%v.stderr", e.ctx.Task.Name),
+		lre, err := logging.NewFileRotator(e.ctx.LogDir, fmt.Sprintf("%v.stderr", e.ctx.Task.Name),
 			e.ctx.Task.LogConfig.MaxFiles, logFileSize, e.logger)
 		if err != nil {
-			return err
+			return fmt.Errorf("error creating new stderr log file for %q: %v", e.ctx.Task.Name, err)
 		}
 		e.lre = lre
 	}
@@ -374,11 +369,15 @@ func (e *UniversalExecutor) UpdateTask(task *structs.Task) error {
 	e.ctx.Task = task
 
 	// Updating Log Config
-	fileSize := int64(task.LogConfig.MaxFileSizeMB * 1024 * 1024)
-	e.lro.MaxFiles = task.LogConfig.MaxFiles
-	e.lro.FileSize = fileSize
-	e.lre.MaxFiles = task.LogConfig.MaxFiles
-	e.lre.FileSize = fileSize
+	e.rotatorLock.Lock()
+	if e.lro != nil && e.lre != nil {
+		fileSize := int64(task.LogConfig.MaxFileSizeMB * 1024 * 1024)
+		e.lro.MaxFiles = task.LogConfig.MaxFiles
+		e.lro.FileSize = fileSize
+		e.lre.MaxFiles = task.LogConfig.MaxFiles
+		e.lre.FileSize = fileSize
+	}
+	e.rotatorLock.Unlock()
 
 	// Re-syncing task with Consul agent
 	if e.consulSyncer != nil {
@@ -457,8 +456,14 @@ func (e *UniversalExecutor) Exit() error {
 	if e.syslogServer != nil {
 		e.syslogServer.Shutdown()
 	}
-	e.lre.Close()
-	e.lro.Close()
+
+	if e.lre != nil {
+		e.lre.Close()
+	}
+
+	if e.lro != nil {
+		e.lro.Close()
+	}
 
 	if e.consulSyncer != nil {
 		e.consulSyncer.Shutdown()
@@ -483,12 +488,6 @@ func (e *UniversalExecutor) Exit() error {
 
 	if e.command.ResourceLimits {
 		if err := e.resConCtx.executorCleanup(); err != nil {
-			merr.Errors = append(merr.Errors, err)
-		}
-	}
-
-	if e.command.FSIsolation {
-		if err := e.removeChrootMounts(); err != nil {
 			merr.Errors = append(merr.Errors, err)
 		}
 	}
@@ -560,7 +559,7 @@ func (e *UniversalExecutor) pidStats() (map[string]*cstructs.ResourceUsage, erro
 	for pid, np := range pids {
 		p, err := process.NewProcess(int32(pid))
 		if err != nil {
-			e.logger.Printf("[DEBUG] executor: unable to create new process with pid: %v", pid)
+			e.logger.Printf("[TRACE] executor: unable to create new process with pid: %v", pid)
 			continue
 		}
 		ms := &cstructs.MemoryStats{}
@@ -585,29 +584,18 @@ func (e *UniversalExecutor) pidStats() (map[string]*cstructs.ResourceUsage, erro
 	return stats, nil
 }
 
-// configureTaskDir sets the task dir in the executor
-func (e *UniversalExecutor) configureTaskDir() error {
-	taskDir, ok := e.ctx.AllocDir.TaskDirs[e.ctx.Task.Name]
-	e.taskDir = taskDir
-	if !ok {
-		return fmt.Errorf("couldn't find task directory for task %v", e.ctx.Task.Name)
-	}
-	e.cmd.Dir = taskDir
-	return nil
-}
-
 // lookupBin looks for path to the binary to run by looking for the binary in
 // the following locations, in-order: task/local/, task/, based on host $PATH.
 // The return path is absolute.
 func (e *UniversalExecutor) lookupBin(bin string) (string, error) {
 	// Check in the local directory
-	local := filepath.Join(e.taskDir, allocdir.TaskLocal, bin)
+	local := filepath.Join(e.ctx.TaskDir, allocdir.TaskLocal, bin)
 	if _, err := os.Stat(local); err == nil {
 		return local, nil
 	}
 
 	// Check at the root of the task's directory
-	root := filepath.Join(e.taskDir, bin)
+	root := filepath.Join(e.ctx.TaskDir, bin)
 	if _, err := os.Stat(root); err == nil {
 		return root, nil
 	}
@@ -721,7 +709,7 @@ func (e *UniversalExecutor) createCheck(check *structs.ServiceCheck, checkID str
 			timeout:     check.Timeout,
 			cmd:         check.Command,
 			args:        check.Args,
-			taskDir:     e.taskDir,
+			taskDir:     e.ctx.TaskDir,
 			FSIsolation: e.command.FSIsolation,
 		}, nil
 
@@ -735,15 +723,17 @@ func (e *UniversalExecutor) interpolateServices(task *structs.Task) {
 	e.ctx.TaskEnv.Build()
 	for _, service := range task.Services {
 		for _, check := range service.Checks {
-			if check.Type == structs.ServiceCheckScript {
-				check.Name = e.ctx.TaskEnv.ReplaceEnv(check.Name)
-				check.Command = e.ctx.TaskEnv.ReplaceEnv(check.Command)
-				check.Args = e.ctx.TaskEnv.ParseAndReplace(check.Args)
-				check.Path = e.ctx.TaskEnv.ReplaceEnv(check.Path)
-				check.Protocol = e.ctx.TaskEnv.ReplaceEnv(check.Protocol)
-			}
+			check.Name = e.ctx.TaskEnv.ReplaceEnv(check.Name)
+			check.Type = e.ctx.TaskEnv.ReplaceEnv(check.Type)
+			check.Command = e.ctx.TaskEnv.ReplaceEnv(check.Command)
+			check.Args = e.ctx.TaskEnv.ParseAndReplace(check.Args)
+			check.Path = e.ctx.TaskEnv.ReplaceEnv(check.Path)
+			check.Protocol = e.ctx.TaskEnv.ReplaceEnv(check.Protocol)
+			check.PortLabel = e.ctx.TaskEnv.ReplaceEnv(check.PortLabel)
+			check.InitialStatus = e.ctx.TaskEnv.ReplaceEnv(check.InitialStatus)
 		}
 		service.Name = e.ctx.TaskEnv.ReplaceEnv(service.Name)
+		service.PortLabel = e.ctx.TaskEnv.ReplaceEnv(service.PortLabel)
 		service.Tags = e.ctx.TaskEnv.ParseAndReplace(service.Tags)
 	}
 }

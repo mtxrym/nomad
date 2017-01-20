@@ -10,10 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +24,7 @@ import (
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-version"
+	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/args"
 	"github.com/mitchellh/copystructure"
 	"github.com/ugorji/go/codec"
@@ -247,7 +250,8 @@ type JobEvaluateRequest struct {
 
 // JobSpecificRequest is used when we just need to specify a target job
 type JobSpecificRequest struct {
-	JobID string
+	JobID     string
+	AllAllocs bool
 	QueryOptions
 }
 
@@ -268,6 +272,14 @@ type JobPlanRequest struct {
 type JobSummaryRequest struct {
 	JobID string
 	QueryOptions
+}
+
+// JobDispatchRequest is used to dispatch a job based on a constructor job
+type JobDispatchRequest struct {
+	JobID   string
+	Payload []byte
+	Meta    map[string]string
+	WriteRequest
 }
 
 // NodeListRequest is used to parameterize a list request
@@ -304,8 +316,9 @@ type EvalAckRequest struct {
 
 // EvalDequeueRequest is used when we want to dequeue an evaluation
 type EvalDequeueRequest struct {
-	Schedulers []string
-	Timeout    time.Duration
+	Schedulers       []string
+	Timeout          time.Duration
+	SchedulerVersion uint16
 	WriteRequest
 }
 
@@ -357,6 +370,29 @@ type PeriodicForceRequest struct {
 	WriteRequest
 }
 
+// ServerMembersResponse has the list of servers in a cluster
+type ServerMembersResponse struct {
+	ServerName   string
+	ServerRegion string
+	ServerDC     string
+	Members      []*ServerMember
+}
+
+// ServerMember holds information about a Nomad server agent in a cluster
+type ServerMember struct {
+	Name        string
+	Addr        net.IP
+	Port        uint16
+	Tags        map[string]string
+	Status      string
+	ProtocolMin uint8
+	ProtocolMax uint8
+	ProtocolCur uint8
+	DelegateMin uint8
+	DelegateMax uint8
+	DelegateCur uint8
+}
+
 // DeriveVaultTokenRequest is used to request wrapped Vault tokens for the
 // following tasks in the given allocation
 type DeriveVaultTokenRequest struct {
@@ -389,6 +425,11 @@ type VaultAccessor struct {
 type DeriveVaultTokenResponse struct {
 	// Tasks is a mapping between the task name and the wrapped token
 	Tasks map[string]string
+
+	// Error stores any error that occured. Errors are stored here so we can
+	// communicate whether it is retriable
+	Error *RecoverableError
+
 	QueryMeta
 }
 
@@ -491,6 +532,14 @@ type SingleJobResponse struct {
 // JobSummaryResponse is used to return a single job summary
 type JobSummaryResponse struct {
 	JobSummary *JobSummary
+	QueryMeta
+}
+
+type JobDispatchResponse struct {
+	DispatchedJobID string
+	EvalID          string
+	EvalCreateIndex uint64
+	JobCreateIndex  uint64
 	QueryMeta
 }
 
@@ -647,6 +696,9 @@ type Node struct {
 	// requests
 	HTTPAddr string
 
+	// TLSEnabled indicates if the Agent has TLS enabled for the HTTP API
+	TLSEnabled bool
+
 	// Attributes is an arbitrary set of key/value
 	// data that can be used for constraints. Examples
 	// include "kernel.name=linux", "arch=386", "driver.docker=1",
@@ -712,11 +764,11 @@ func (n *Node) Copy() *Node {
 	}
 	nn := new(Node)
 	*nn = *n
-	nn.Attributes = CopyMapStringString(nn.Attributes)
+	nn.Attributes = helper.CopyMapStringString(nn.Attributes)
 	nn.Resources = nn.Resources.Copy()
 	nn.Reserved = nn.Reserved.Copy()
-	nn.Links = CopyMapStringString(nn.Links)
-	nn.Meta = CopyMapStringString(nn.Meta)
+	nn.Links = helper.CopyMapStringString(nn.Links)
+	nn.Meta = helper.CopyMapStringString(nn.Meta)
 	return nn
 }
 
@@ -1028,39 +1080,6 @@ const (
 	CoreJobPriority = JobMaxPriority * 2
 )
 
-// JobSummary summarizes the state of the allocations of a job
-type JobSummary struct {
-	JobID   string
-	Summary map[string]TaskGroupSummary
-
-	// Raft Indexes
-	CreateIndex uint64
-	ModifyIndex uint64
-}
-
-// Copy returns a new copy of JobSummary
-func (js *JobSummary) Copy() *JobSummary {
-	newJobSummary := new(JobSummary)
-	*newJobSummary = *js
-	newTGSummary := make(map[string]TaskGroupSummary, len(js.Summary))
-	for k, v := range js.Summary {
-		newTGSummary[k] = v
-	}
-	newJobSummary.Summary = newTGSummary
-	return newJobSummary
-}
-
-// TaskGroup summarizes the state of all the allocations of a particular
-// TaskGroup
-type TaskGroupSummary struct {
-	Queued   int
-	Complete int
-	Failed   int
-	Running  int
-	Starting int
-	Lost     int
-}
-
 // Job is the scope of a scheduling request to Nomad. It is the largest
 // scoped object, and is a named collection of task groups. Each task group
 // is further composed of tasks. A task group (TG) is the unit of scheduling
@@ -1112,6 +1131,12 @@ type Job struct {
 	// Periodic is used to define the interval the job is run at.
 	Periodic *PeriodicConfig
 
+	// Constructor is used to specify the job as a constructor job for dispatching.
+	Constructor *ConstructorConfig
+
+	// Payload is the payload supplied when the job was dispatched.
+	Payload []byte
+
 	// Meta is used to associate arbitrary metadata with this
 	// job. This is opaque to Nomad.
 	Meta map[string]string
@@ -1145,6 +1170,10 @@ func (j *Job) Canonicalize() {
 	for _, tg := range j.TaskGroups {
 		tg.Canonicalize(j)
 	}
+
+	if j.Constructor != nil {
+		j.Constructor.Canonicalize()
+	}
 }
 
 // Copy returns a deep copy of the Job. It is expected that callers use recover.
@@ -1155,7 +1184,7 @@ func (j *Job) Copy() *Job {
 	}
 	nj := new(Job)
 	*nj = *j
-	nj.Datacenters = CopySliceString(nj.Datacenters)
+	nj.Datacenters = helper.CopySliceString(nj.Datacenters)
 	nj.Constraints = CopySliceConstraints(nj.Constraints)
 
 	if j.TaskGroups != nil {
@@ -1167,7 +1196,8 @@ func (j *Job) Copy() *Job {
 	}
 
 	nj.Periodic = nj.Periodic.Copy()
-	nj.Meta = CopyMapStringString(nj.Meta)
+	nj.Meta = helper.CopyMapStringString(nj.Meta)
+	nj.Constructor = nj.Constructor.Copy()
 	return nj
 }
 
@@ -1242,6 +1272,17 @@ func (j *Job) Validate() error {
 		}
 	}
 
+	if j.IsConstructor() {
+		if j.Type != JobTypeBatch {
+			mErr.Errors = append(mErr.Errors,
+				fmt.Errorf("Constructor job can only be used with %q scheduler", JobTypeBatch))
+		}
+
+		if err := j.Constructor.Validate(); err != nil {
+			mErr.Errors = append(mErr.Errors, err)
+		}
+	}
+
 	return mErr.ErrorOrNil()
 }
 
@@ -1253,6 +1294,42 @@ func (j *Job) LookupTaskGroup(name string) *TaskGroup {
 		}
 	}
 	return nil
+}
+
+// CombinedTaskMeta takes a TaskGroup and Task name and returns the combined
+// meta data for the task. When joining Job, Group and Task Meta, the precedence
+// is by deepest scope (Task > Group > Job).
+func (j *Job) CombinedTaskMeta(groupName, taskName string) map[string]string {
+	group := j.LookupTaskGroup(groupName)
+	if group == nil {
+		return nil
+	}
+
+	task := group.LookupTask(taskName)
+	if task == nil {
+		return nil
+	}
+
+	meta := helper.CopyMapStringString(task.Meta)
+	if meta == nil {
+		meta = make(map[string]string, len(group.Meta)+len(j.Meta))
+	}
+
+	// Add the group specific meta
+	for k, v := range group.Meta {
+		if _, ok := meta[k]; !ok {
+			meta[k] = v
+		}
+	}
+
+	// Add the job specific meta
+	for k, v := range j.Meta {
+		if _, ok := meta[k]; !ok {
+			meta[k] = v
+		}
+	}
+
+	return meta
 }
 
 // Stub is used to return a summary of the job
@@ -1275,6 +1352,11 @@ func (j *Job) Stub(summary *JobSummary) *JobListStub {
 // IsPeriodic returns whether a job is periodic.
 func (j *Job) IsPeriodic() bool {
 	return j.Periodic != nil
+}
+
+// IsConstructor returns whether a job is constructor job.
+func (j *Job) IsConstructor() bool {
+	return j.Constructor != nil
 }
 
 // VaultPolicies returns the set of Vault policies per task group, per task
@@ -1300,6 +1382,55 @@ func (j *Job) VaultPolicies() map[string]map[string]*Vault {
 	return policies
 }
 
+// RequiredSignals returns a mapping of task groups to tasks to their required
+// set of signals
+func (j *Job) RequiredSignals() map[string]map[string][]string {
+	signals := make(map[string]map[string][]string)
+
+	for _, tg := range j.TaskGroups {
+		for _, task := range tg.Tasks {
+			// Use this local one as a set
+			taskSignals := make(map[string]struct{})
+
+			// Check if the Vault change mode uses signals
+			if task.Vault != nil && task.Vault.ChangeMode == VaultChangeModeSignal {
+				taskSignals[task.Vault.ChangeSignal] = struct{}{}
+			}
+
+			// Check if any template change mode uses signals
+			for _, t := range task.Templates {
+				if t.ChangeMode != TemplateChangeModeSignal {
+					continue
+				}
+
+				taskSignals[t.ChangeSignal] = struct{}{}
+			}
+
+			// Flatten and sort the signals
+			l := len(taskSignals)
+			if l == 0 {
+				continue
+			}
+
+			flat := make([]string, 0, l)
+			for sig := range taskSignals {
+				flat = append(flat, sig)
+			}
+
+			sort.Strings(flat)
+			tgSignals, ok := signals[tg.Name]
+			if !ok {
+				tgSignals = make(map[string][]string)
+				signals[tg.Name] = tgSignals
+			}
+			tgSignals[task.Name] = flat
+		}
+
+	}
+
+	return signals
+}
+
 // JobListStub is used to return a subset of job information
 // for the job list
 type JobListStub struct {
@@ -1314,6 +1445,63 @@ type JobListStub struct {
 	CreateIndex       uint64
 	ModifyIndex       uint64
 	JobModifyIndex    uint64
+}
+
+// JobSummary summarizes the state of the allocations of a job
+type JobSummary struct {
+	JobID string
+
+	// Summmary contains the summary per task group for the Job
+	Summary map[string]TaskGroupSummary
+
+	// Children contains a summary for the children of this job.
+	Children *JobChildrenSummary
+
+	// Raft Indexes
+	CreateIndex uint64
+	ModifyIndex uint64
+}
+
+// Copy returns a new copy of JobSummary
+func (js *JobSummary) Copy() *JobSummary {
+	newJobSummary := new(JobSummary)
+	*newJobSummary = *js
+	newTGSummary := make(map[string]TaskGroupSummary, len(js.Summary))
+	for k, v := range js.Summary {
+		newTGSummary[k] = v
+	}
+	newJobSummary.Summary = newTGSummary
+	newJobSummary.Children = newJobSummary.Children.Copy()
+	return newJobSummary
+}
+
+// JobChildrenSummary contains the summary of children job statuses
+type JobChildrenSummary struct {
+	Pending int64
+	Running int64
+	Dead    int64
+}
+
+// Copy returns a new copy of a JobChildrenSummary
+func (jc *JobChildrenSummary) Copy() *JobChildrenSummary {
+	if jc == nil {
+		return nil
+	}
+
+	njc := new(JobChildrenSummary)
+	*njc = *jc
+	return njc
+}
+
+// TaskGroup summarizes the state of all the allocations of a particular
+// TaskGroup
+type TaskGroupSummary struct {
+	Queued   int
+	Complete int
+	Failed   int
+	Running  int
+	Starting int
+	Lost     int
 }
 
 // UpdateStrategy is used to modify how updates are done
@@ -1440,6 +1628,96 @@ type PeriodicLaunch struct {
 	// Raft Indexes
 	CreateIndex uint64
 	ModifyIndex uint64
+}
+
+const (
+	DispatchPayloadForbidden = "forbidden"
+	DispatchPayloadOptional  = "optional"
+	DispatchPayloadRequired  = "required"
+
+	// DispatchLaunchSuffic is the string appended to the constructor job's ID
+	// when dispatching instances of it.
+	DispatchLaunchSuffic = "/dispatch-"
+)
+
+// ConstructorConfig is used to configure the constructor job
+type ConstructorConfig struct {
+	// Payload configure the payload requirements
+	Payload string
+
+	// MetaRequired is metadata keys that must be specified by the dispatcher
+	MetaRequired []string `mapstructure:"required"`
+
+	// MetaOptional is metadata keys that may be specified by the dispatcher
+	MetaOptional []string `mapstructure:"optional"`
+}
+
+func (d *ConstructorConfig) Validate() error {
+	var mErr multierror.Error
+	switch d.Payload {
+	case DispatchPayloadOptional, DispatchPayloadRequired, DispatchPayloadForbidden:
+	default:
+		multierror.Append(&mErr, fmt.Errorf("Unknown payload requirement: %q", d.Payload))
+	}
+
+	// Check that the meta configurations are disjoint sets
+	disjoint, offending := helper.SliceSetDisjoint(d.MetaRequired, d.MetaOptional)
+	if !disjoint {
+		multierror.Append(&mErr, fmt.Errorf("Required and optional meta keys should be disjoint. Following keys exist in both: %v", offending))
+	}
+
+	return mErr.ErrorOrNil()
+}
+
+func (d *ConstructorConfig) Canonicalize() {
+	if d.Payload == "" {
+		d.Payload = DispatchPayloadOptional
+	}
+}
+
+func (d *ConstructorConfig) Copy() *ConstructorConfig {
+	if d == nil {
+		return nil
+	}
+	nd := new(ConstructorConfig)
+	*nd = *d
+	nd.MetaOptional = helper.CopySliceString(nd.MetaOptional)
+	nd.MetaRequired = helper.CopySliceString(nd.MetaRequired)
+	return nd
+}
+
+// DispatchedID returns an ID appropriate for a job dispatched against a
+// particular constructor
+func DispatchedID(templateID string, t time.Time) string {
+	u := GenerateUUID()[:8]
+	return fmt.Sprintf("%s%s%d-%s", templateID, DispatchLaunchSuffic, t.Unix(), u)
+}
+
+// DispatchInputConfig configures how a task gets its input from a job dispatch
+type DispatchInputConfig struct {
+	// File specifies a relative path to where the input data should be written
+	File string
+}
+
+func (d *DispatchInputConfig) Copy() *DispatchInputConfig {
+	if d == nil {
+		return nil
+	}
+	nd := new(DispatchInputConfig)
+	*nd = *d
+	return nd
+}
+
+func (d *DispatchInputConfig) Validate() error {
+	// Verify the destination doesn't escape
+	escaped, err := PathEscapesAllocDir("task/local/", d.File)
+	if err != nil {
+		return fmt.Errorf("invalid destination path: %v", err)
+	} else if escaped {
+		return fmt.Errorf("destination escapes allocation directory")
+	}
+
+	return nil
 }
 
 var (
@@ -1573,7 +1851,7 @@ func (tg *TaskGroup) Copy() *TaskGroup {
 		ntg.Tasks = tasks
 	}
 
-	ntg.Meta = CopyMapStringString(ntg.Meta)
+	ntg.Meta = helper.CopyMapStringString(ntg.Meta)
 
 	if tg.EphemeralDisk != nil {
 		ntg.EphemeralDisk = tg.EphemeralDisk.Copy()
@@ -1594,8 +1872,26 @@ func (tg *TaskGroup) Canonicalize(job *Job) {
 		tg.RestartPolicy = NewRestartPolicy(job.Type)
 	}
 
+	// Set a default ephemeral disk object if the user has not requested for one
+	if tg.EphemeralDisk == nil {
+		tg.EphemeralDisk = DefaultEphemeralDisk()
+	}
+
 	for _, task := range tg.Tasks {
 		task.Canonicalize(job, tg)
+	}
+
+	// Add up the disk resources to EphemeralDisk. This is done so that users
+	// are not required to move their disk attribute from resources to
+	// EphemeralDisk section of the job spec in Nomad 0.5
+	// COMPAT 0.4.1 -> 0.5
+	// Remove in 0.6
+	var diskMB int
+	for _, task := range tg.Tasks {
+		diskMB += task.Resources.DiskMB
+	}
+	if diskMB > 0 {
+		tg.EphemeralDisk.SizeMB = diskMB
 	}
 }
 
@@ -1726,7 +2022,9 @@ func (sc *ServiceCheck) Canonicalize(serviceName string) {
 func (sc *ServiceCheck) validate() error {
 	switch strings.ToLower(sc.Type) {
 	case ServiceCheckTCP:
-		if sc.Timeout < minCheckTimeout {
+		if sc.Timeout == 0 {
+			return fmt.Errorf("missing required value timeout. Timeout cannot be less than %v", minCheckInterval)
+		} else if sc.Timeout < minCheckTimeout {
 			return fmt.Errorf("timeout (%v) is lower than required minimum timeout %v", sc.Timeout, minCheckInterval)
 		}
 	case ServiceCheckHTTP:
@@ -1734,7 +2032,9 @@ func (sc *ServiceCheck) validate() error {
 			return fmt.Errorf("http type must have a valid http path")
 		}
 
-		if sc.Timeout < minCheckTimeout {
+		if sc.Timeout == 0 {
+			return fmt.Errorf("missing required value timeout. Timeout cannot be less than %v", minCheckInterval)
+		} else if sc.Timeout < minCheckTimeout {
 			return fmt.Errorf("timeout (%v) is lower than required minimum timeout %v", sc.Timeout, minCheckInterval)
 		}
 	case ServiceCheckScript:
@@ -1748,8 +2048,10 @@ func (sc *ServiceCheck) validate() error {
 		return fmt.Errorf(`invalid type (%+q), must be one of "http", "tcp", or "script" type`, sc.Type)
 	}
 
-	if sc.Interval < minCheckInterval {
-		return fmt.Errorf("interval (%v) can not be lower than %v", sc.Interval, minCheckInterval)
+	if sc.Interval == 0 {
+		return fmt.Errorf("missing required value interval. Interval cannot be less than %v", minCheckInterval)
+	} else if sc.Interval < minCheckInterval {
+		return fmt.Errorf("interval (%v) cannot be lower than %v", sc.Interval, minCheckInterval)
 	}
 
 	switch sc.InitialStatus {
@@ -1812,7 +2114,7 @@ func (s *Service) Copy() *Service {
 	}
 	ns := new(Service)
 	*ns = *s
-	ns.Tags = CopySliceString(ns.Tags)
+	ns.Tags = helper.CopySliceString(ns.Tags)
 
 	if s.Checks != nil {
 		checks := make([]*ServiceCheck, len(ns.Checks))
@@ -1854,13 +2156,14 @@ func (s *Service) Canonicalize(job string, taskGroup string, task string) {
 func (s *Service) Validate() error {
 	var mErr multierror.Error
 
-	// Ensure the service name is valid per RFC-952 §1
-	// (https://tools.ietf.org/html/rfc952), RFC-1123 §2.1
+	// Ensure the service name is valid per the below RFCs but make an exception
+	// for our interpolation syntax
+	// RFC-952 §1 (https://tools.ietf.org/html/rfc952), RFC-1123 §2.1
 	// (https://tools.ietf.org/html/rfc1123), and RFC-2782
 	// (https://tools.ietf.org/html/rfc2782).
-	re := regexp.MustCompile(`^(?i:[a-z0-9]|[a-z0-9][a-z0-9\-]{0,61}[a-z0-9])$`)
+	re := regexp.MustCompile(`^(?i:[a-z0-9]|[a-z0-9\$][a-zA-Z0-9\-\$\{\}\_\.]*[a-z0-9\}])$`)
 	if !re.MatchString(s.Name) {
-		mErr.Errors = append(mErr.Errors, fmt.Errorf("service name must be valid per RFC 1123 and can contain only alphanumeric characters or dashes and must be less than 63 characters long: %q", s.Name))
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("service name must be valid per RFC 1123 and can contain only alphanumeric characters or dashes: %q", s.Name))
 	}
 
 	for _, c := range s.Checks {
@@ -1874,6 +2177,20 @@ func (s *Service) Validate() error {
 		}
 	}
 	return mErr.ErrorOrNil()
+}
+
+// ValidateName checks if the services Name is valid and should be called after
+// the name has been interpolated
+func (s *Service) ValidateName(name string) error {
+	// Ensure the service name is valid per RFC-952 §1
+	// (https://tools.ietf.org/html/rfc952), RFC-1123 §2.1
+	// (https://tools.ietf.org/html/rfc1123), and RFC-2782
+	// (https://tools.ietf.org/html/rfc2782).
+	re := regexp.MustCompile(`^(?i:[a-z0-9]|[a-z0-9][a-z0-9\-]{0,61}[a-z0-9])$`)
+	if !re.MatchString(name) {
+		return fmt.Errorf("service name must be valid per RFC 1123 and can contain only alphanumeric characters or dashes and must be less than 63 characters long: %q", name)
+	}
+	return nil
 }
 
 // Hash calculates the hash of the check based on it's content and the service
@@ -1954,6 +2271,9 @@ type Task struct {
 	// Resources is the resources needed by this task
 	Resources *Resources
 
+	// DispatchInput configures how the task retrieves its input from a dispatch
+	DispatchInput *DispatchInputConfig
+
 	// Meta is used to associate arbitrary metadata with this
 	// task. This is opaque to Nomad.
 	Meta map[string]string
@@ -1976,7 +2296,7 @@ func (t *Task) Copy() *Task {
 	}
 	nt := new(Task)
 	*nt = *t
-	nt.Env = CopyMapStringString(nt.Env)
+	nt.Env = helper.CopyMapStringString(nt.Env)
 
 	if t.Services != nil {
 		services := make([]*Service, len(nt.Services))
@@ -1990,7 +2310,8 @@ func (t *Task) Copy() *Task {
 
 	nt.Vault = nt.Vault.Copy()
 	nt.Resources = nt.Resources.Copy()
-	nt.Meta = CopyMapStringString(nt.Meta)
+	nt.Meta = helper.CopyMapStringString(nt.Meta)
+	nt.DispatchInput = nt.DispatchInput.Copy()
 
 	if t.Artifacts != nil {
 		artifacts := make([]*TaskArtifact, 0, len(t.Artifacts))
@@ -2033,13 +2354,24 @@ func (t *Task) Canonicalize(job *Job, tg *TaskGroup) {
 		service.Canonicalize(job.Name, tg.Name, t.Name)
 	}
 
-	if t.Resources != nil {
+	// If Resources are nil initialize them to defaults, otherwise canonicalize
+	if t.Resources == nil {
+		t.Resources = DefaultResources()
+	} else {
 		t.Resources.Canonicalize()
 	}
 
 	// Set the default timeout if it is not specified.
 	if t.KillTimeout == 0 {
 		t.KillTimeout = DefaultKillTimeout
+	}
+
+	if t.Vault != nil {
+		t.Vault.Canonicalize()
+	}
+
+	for _, template := range t.Templates {
+		template.Canonicalize()
 	}
 }
 
@@ -2065,7 +2397,7 @@ func (t *Task) Validate(ephemeralDisk *EphemeralDisk) error {
 	if strings.ContainsAny(t.Name, `/\`) {
 		// We enforce this so that when creating the directory on disk it will
 		// not have any slashes.
-		mErr.Errors = append(mErr.Errors, errors.New("Task name can not include slashes"))
+		mErr.Errors = append(mErr.Errors, errors.New("Task name cannot include slashes"))
 	}
 	if t.Driver == "" {
 		mErr.Errors = append(mErr.Errors, errors.New("Missing task driver"))
@@ -2077,12 +2409,12 @@ func (t *Task) Validate(ephemeralDisk *EphemeralDisk) error {
 	// Validate the resources.
 	if t.Resources == nil {
 		mErr.Errors = append(mErr.Errors, errors.New("Missing task resources"))
-	} else if err := t.Resources.MeetsMinResources(); err != nil {
-		mErr.Errors = append(mErr.Errors, err)
-	}
+	} else {
+		if err := t.Resources.MeetsMinResources(); err != nil {
+			mErr.Errors = append(mErr.Errors, err)
+		}
 
-	// Ensure the task isn't asking for disk resources
-	if t.Resources != nil {
+		// Ensure the task isn't asking for disk resources
 		if t.Resources.DiskMB > 0 {
 			mErr.Errors = append(mErr.Errors, errors.New("Task can't ask for disk resources, they have to be specified at the task group level."))
 		}
@@ -2144,6 +2476,13 @@ func (t *Task) Validate(ephemeralDisk *EphemeralDisk) error {
 		}
 	}
 
+	// Validate the dispatch input block if there
+	if t.DispatchInput != nil {
+		if err := t.DispatchInput.Validate(); err != nil {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("Dispatch Input validation failed: %v", err))
+		}
+	}
+
 	return mErr.ErrorOrNil()
 }
 
@@ -2161,10 +2500,13 @@ func validateServices(t *Task) error {
 			outer := fmt.Errorf("service[%d] %+q validation failed: %s", i, service.Name, err)
 			mErr.Errors = append(mErr.Errors, outer)
 		}
-		if _, ok := knownServices[service.Name]; ok {
+
+		// Ensure that services with the same name are not being registered for
+		// the same port
+		if _, ok := knownServices[service.Name+service.PortLabel]; ok {
 			mErr.Errors = append(mErr.Errors, fmt.Errorf("service %q is duplicate", service.Name))
 		}
-		knownServices[service.Name] = struct{}{}
+		knownServices[service.Name+service.PortLabel] = struct{}{}
 
 		if service.PortLabel != "" {
 			servicePorts[service.PortLabel] = append(servicePorts[service.PortLabel], service.Name)
@@ -2265,6 +2607,12 @@ func (t *Template) Copy() *Template {
 	return copy
 }
 
+func (t *Template) Canonicalize() {
+	if t.ChangeSignal != "" {
+		t.ChangeSignal = strings.ToUpper(t.ChangeSignal)
+	}
+}
+
 func (t *Template) Validate() error {
 	var mErr multierror.Error
 
@@ -2279,7 +2627,7 @@ func (t *Template) Validate() error {
 	}
 
 	// Verify the destination doesn't escape
-	escaped, err := PathEscapesAllocDir(t.DestPath)
+	escaped, err := PathEscapesAllocDir("task", t.DestPath)
 	if err != nil {
 		mErr.Errors = append(mErr.Errors, fmt.Errorf("invalid destination path: %v", err))
 	} else if escaped {
@@ -2318,6 +2666,9 @@ type TaskState struct {
 	// The current state of the task.
 	State string
 
+	// Failed marks a task as having failed
+	Failed bool
+
 	// Series of task events that transition the state of the task.
 	Events []*TaskEvent
 }
@@ -2328,6 +2679,7 @@ func (ts *TaskState) Copy() *TaskState {
 	}
 	copy := new(TaskState)
 	copy.State = ts.State
+	copy.Failed = ts.Failed
 
 	if ts.Events != nil {
 		copy.Events = make([]*TaskEvent, len(ts.Events))
@@ -2336,22 +2688,6 @@ func (ts *TaskState) Copy() *TaskState {
 		}
 	}
 	return copy
-}
-
-// Failed returns true if the task has has failed.
-func (ts *TaskState) Failed() bool {
-	l := len(ts.Events)
-	if ts.State != TaskStateDead || l == 0 {
-		return false
-	}
-
-	switch ts.Events[l-1].Type {
-	case TaskDiskExceeded, TaskNotRestarting, TaskArtifactDownloadFailed,
-		TaskFailedValidation, TaskVaultRenewalFailed, TaskSetupFailure:
-		return true
-	default:
-		return false
-	}
 }
 
 // Successful returns whether a task finished successfully.
@@ -2429,8 +2765,10 @@ const (
 	// failed.
 	TaskSiblingFailed = "Sibling task failed"
 
-	// TaskVaultRenewalFailed indicates that Vault token renewal failed
-	TaskVaultRenewalFailed = "Vault token renewal failed"
+	// TaskDriverMessage is an informational event message emitted by
+	// drivers such as when they're performing a long running action like
+	// downloading an image.
+	TaskDriverMessage = "Driver"
 )
 
 // TaskEvent is an event that effects the state of a task and contains meta-data
@@ -2438,6 +2776,9 @@ const (
 type TaskEvent struct {
 	Type string
 	Time int64 // Unix Nanosecond timestamp
+
+	// FailsTask marks whether this event fails the task
+	FailsTask bool
 
 	// Restart fields.
 	RestartReason string
@@ -2474,9 +2815,6 @@ type TaskEvent struct {
 	// The maximum allowed task disk size.
 	DiskLimit int64
 
-	// The recorded task disk size.
-	DiskSize int64
-
 	// Name of the sibling task that caused termination of the task that
 	// the TaskEvent refers to.
 	FailedSibling string
@@ -2489,6 +2827,9 @@ type TaskEvent struct {
 
 	// TaskSignal is the signal that was sent to the task
 	TaskSignal string
+
+	// DriverMessage indicates a driver action being taken.
+	DriverMessage string
 }
 
 func (te *TaskEvent) GoString() string {
@@ -2517,6 +2858,11 @@ func (e *TaskEvent) SetSetupError(err error) *TaskEvent {
 	if err != nil {
 		e.SetupError = err.Error()
 	}
+	return e
+}
+
+func (e *TaskEvent) SetFailsTask() *TaskEvent {
+	e.FailsTask = true
 	return e
 }
 
@@ -2600,11 +2946,6 @@ func (e *TaskEvent) SetDiskLimit(limit int64) *TaskEvent {
 	return e
 }
 
-func (e *TaskEvent) SetDiskSize(size int64) *TaskEvent {
-	e.DiskSize = size
-	return e
-}
-
 func (e *TaskEvent) SetFailedSibling(sibling string) *TaskEvent {
 	e.FailedSibling = sibling
 	return e
@@ -2614,6 +2955,11 @@ func (e *TaskEvent) SetVaultRenewalError(err error) *TaskEvent {
 	if err != nil {
 		e.VaultError = err.Error()
 	}
+	return e
+}
+
+func (e *TaskEvent) SetDriverMessage(m string) *TaskEvent {
+	e.DriverMessage = m
 	return e
 }
 
@@ -2637,7 +2983,7 @@ func (ta *TaskArtifact) Copy() *TaskArtifact {
 	}
 	nta := new(TaskArtifact)
 	*nta = *ta
-	nta.GetterOptions = CopyMapStringString(ta.GetterOptions)
+	nta.GetterOptions = helper.CopyMapStringString(ta.GetterOptions)
 	return nta
 }
 
@@ -2646,14 +2992,16 @@ func (ta *TaskArtifact) GoString() string {
 }
 
 // PathEscapesAllocDir returns if the given path escapes the allocation
-// directory
-func PathEscapesAllocDir(path string) (bool, error) {
+// directory. The prefix allows adding a prefix if the path will be joined, for
+// example a "task/local" prefix may be provided if the path will be joined
+// against that prefix.
+func PathEscapesAllocDir(prefix, path string) (bool, error) {
 	// Verify the destination doesn't escape the tasks directory
-	alloc, err := filepath.Abs(filepath.Join("/", "foo/", "bar/"))
+	alloc, err := filepath.Abs(filepath.Join("/", "alloc-dir/", "alloc-id/"))
 	if err != nil {
 		return false, err
 	}
-	abs, err := filepath.Abs(filepath.Join(alloc, path))
+	abs, err := filepath.Abs(filepath.Join(alloc, prefix, path))
 	if err != nil {
 		return false, err
 	}
@@ -2672,18 +3020,18 @@ func (ta *TaskArtifact) Validate() error {
 		mErr.Errors = append(mErr.Errors, fmt.Errorf("source must be specified"))
 	}
 
-	escaped, err := PathEscapesAllocDir(ta.RelativeDest)
+	escaped, err := PathEscapesAllocDir("task", ta.RelativeDest)
 	if err != nil {
 		mErr.Errors = append(mErr.Errors, fmt.Errorf("invalid destination path: %v", err))
 	} else if escaped {
-		mErr.Errors = append(mErr.Errors, fmt.Errorf("destination escapes task's directory"))
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("destination escapes allocation directory"))
 	}
 
 	// Verify the checksum
 	if check, ok := ta.GetterOptions["checksum"]; ok {
 		check = strings.TrimSpace(check)
 		if check == "" {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("checksum value can not be empty"))
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("checksum value cannot be empty"))
 			return mErr.ErrorOrNil()
 		}
 
@@ -2729,6 +3077,7 @@ const (
 	ConstraintDistinctHosts = "distinct_hosts"
 	ConstraintRegex         = "regexp"
 	ConstraintVersion       = "version"
+	ConstraintSetContains   = "set_contains"
 )
 
 // Constraints are used to restrict placement options.
@@ -2865,6 +3214,12 @@ func (v *Vault) Copy() *Vault {
 	return nv
 }
 
+func (v *Vault) Canonicalize() {
+	if v.ChangeSignal != "" {
+		v.ChangeSignal = strings.ToUpper(v.ChangeSignal)
+	}
+}
+
 // Validate returns if the Vault block is valid.
 func (v *Vault) Validate() error {
 	if v == nil {
@@ -2872,7 +3227,7 @@ func (v *Vault) Validate() error {
 	}
 
 	if len(v.Policies) == 0 {
-		return fmt.Errorf("Policy list can not be empty")
+		return fmt.Errorf("Policy list cannot be empty")
 	}
 
 	switch v.ChangeMode {
@@ -3180,12 +3535,12 @@ func (a *AllocMetric) Copy() *AllocMetric {
 	}
 	na := new(AllocMetric)
 	*na = *a
-	na.NodesAvailable = CopyMapStringInt(na.NodesAvailable)
-	na.ClassFiltered = CopyMapStringInt(na.ClassFiltered)
-	na.ConstraintFiltered = CopyMapStringInt(na.ConstraintFiltered)
-	na.ClassExhausted = CopyMapStringInt(na.ClassExhausted)
-	na.DimensionExhausted = CopyMapStringInt(na.DimensionExhausted)
-	na.Scores = CopyMapStringFloat64(na.Scores)
+	na.NodesAvailable = helper.CopyMapStringInt(na.NodesAvailable)
+	na.ClassFiltered = helper.CopyMapStringInt(na.ClassFiltered)
+	na.ConstraintFiltered = helper.CopyMapStringInt(na.ConstraintFiltered)
+	na.ClassExhausted = helper.CopyMapStringInt(na.ClassExhausted)
+	na.DimensionExhausted = helper.CopyMapStringInt(na.DimensionExhausted)
+	na.Scores = helper.CopyMapStringFloat64(na.Scores)
 	return na
 }
 
@@ -3687,4 +4042,28 @@ type KeyringResponse struct {
 // KeyringRequest is request objects for serf key operations.
 type KeyringRequest struct {
 	Key string
+}
+
+// RecoverableError wraps an error and marks whether it is recoverable and could
+// be retried or it is fatal.
+type RecoverableError struct {
+	Err         string
+	Recoverable bool
+}
+
+// NewRecoverableError is used to wrap an error and mark it as recoverable or
+// not.
+func NewRecoverableError(e error, recoverable bool) *RecoverableError {
+	if e == nil {
+		return nil
+	}
+
+	return &RecoverableError{
+		Err:         e.Error(),
+		Recoverable: recoverable,
+	}
+}
+
+func (r *RecoverableError) Error() string {
+	return r.Err
 }

@@ -37,26 +37,6 @@ func (r *WaitResult) String() string {
 		r.ExitCode, r.Signal, r.Err)
 }
 
-// RecoverableError wraps an error and marks whether it is recoverable and could
-// be retried or it is fatal.
-type RecoverableError struct {
-	Err         error
-	Recoverable bool
-}
-
-// NewRecoverableError is used to wrap an error and mark it as recoverable or
-// not.
-func NewRecoverableError(e error, recoverable bool) *RecoverableError {
-	return &RecoverableError{
-		Err:         e,
-		Recoverable: recoverable,
-	}
-}
-
-func (r *RecoverableError) Error() string {
-	return r.Err.Error()
-}
-
 // CheckResult encapsulates the result of a check
 type CheckResult struct {
 
@@ -74,4 +54,14 @@ type CheckResult struct {
 
 	// Err is the error that a check returned
 	Err error
+}
+
+// ExecutorConfig is the config that Nomad passes to the executor
+type ExecutorConfig struct {
+
+	// LogFile is the file to which Executor logs
+	LogFile string
+
+	// LogLevel is the level of the logs to putout
+	LogLevel string
 }

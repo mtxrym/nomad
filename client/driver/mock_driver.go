@@ -27,6 +27,13 @@ func init() {
 // MockDriverConfig is the driver configuration for the MockDriver
 type MockDriverConfig struct {
 
+	// StartErr specifies the error that should be returned when starting the
+	// mock driver.
+	StartErr string `mapstructure:"start_error"`
+
+	// StartErrRecoverable marks the error returned is recoverable
+	StartErrRecoverable bool `mapstructure:"start_error_recoverable"`
+
 	// KillAfter is the duration after which the mock driver indicates the task
 	// has exited after getting the initial SIGINT signal
 	KillAfter time.Duration `mapstructure:"kill_after"`
@@ -62,6 +69,20 @@ func NewMockDriver(ctx *DriverContext) Driver {
 	return &MockDriver{DriverContext: *ctx}
 }
 
+func (d *MockDriver) Abilities() DriverAbilities {
+	return DriverAbilities{
+		SendSignals: false,
+	}
+}
+
+func (d *MockDriver) FSIsolation() cstructs.FSIsolation {
+	return cstructs.FSIsolationNone
+}
+
+func (d *MockDriver) Prestart(ctx *ExecContext, task *structs.Task) error {
+	return nil
+}
+
 // Start starts the mock driver
 func (m *MockDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error) {
 	var driverConfig MockDriverConfig
@@ -75,6 +96,10 @@ func (m *MockDriver) Start(ctx *ExecContext, task *structs.Task) (DriverHandle, 
 	}
 	if err := dec.Decode(task.Config); err != nil {
 		return nil, err
+	}
+
+	if driverConfig.StartErr != "" {
+		return nil, structs.NewRecoverableError(errors.New(driverConfig.StartErr), driverConfig.StartErrRecoverable)
 	}
 
 	h := mockDriverHandle{

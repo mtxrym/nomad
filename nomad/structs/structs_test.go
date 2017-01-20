@@ -305,6 +305,93 @@ func TestJob_VaultPolicies(t *testing.T) {
 	}
 }
 
+func TestJob_RequiredSignals(t *testing.T) {
+	j0 := &Job{}
+	e0 := make(map[string]map[string][]string, 0)
+
+	vj1 := &Vault{
+		Policies:   []string{"p1"},
+		ChangeMode: VaultChangeModeNoop,
+	}
+	vj2 := &Vault{
+		Policies:     []string{"p1"},
+		ChangeMode:   VaultChangeModeSignal,
+		ChangeSignal: "SIGUSR1",
+	}
+	tj1 := &Template{
+		SourcePath: "foo",
+		DestPath:   "bar",
+		ChangeMode: TemplateChangeModeNoop,
+	}
+	tj2 := &Template{
+		SourcePath:   "foo",
+		DestPath:     "bar",
+		ChangeMode:   TemplateChangeModeSignal,
+		ChangeSignal: "SIGUSR2",
+	}
+	j1 := &Job{
+		TaskGroups: []*TaskGroup{
+			&TaskGroup{
+				Name: "foo",
+				Tasks: []*Task{
+					&Task{
+						Name: "t1",
+					},
+					&Task{
+						Name:      "t2",
+						Vault:     vj2,
+						Templates: []*Template{tj2},
+					},
+				},
+			},
+			&TaskGroup{
+				Name: "bar",
+				Tasks: []*Task{
+					&Task{
+						Name:      "t3",
+						Vault:     vj1,
+						Templates: []*Template{tj1},
+					},
+					&Task{
+						Name:  "t4",
+						Vault: vj2,
+					},
+				},
+			},
+		},
+	}
+
+	e1 := map[string]map[string][]string{
+		"foo": map[string][]string{
+			"t2": []string{"SIGUSR1", "SIGUSR2"},
+		},
+		"bar": map[string][]string{
+			"t4": []string{"SIGUSR1"},
+		},
+	}
+
+	cases := []struct {
+		Job      *Job
+		Expected map[string]map[string][]string
+	}{
+		{
+			Job:      j0,
+			Expected: e0,
+		},
+		{
+			Job:      j1,
+			Expected: e1,
+		},
+	}
+
+	for i, c := range cases {
+		got := c.Job.RequiredSignals()
+		if !reflect.DeepEqual(got, c.Expected) {
+			t.Fatalf("case %d: got %#v; want %#v", i+1, got, c.Expected)
+		}
+	}
+}
+
 func TestTaskGroup_Validate(t *testing.T) {
 	tg := &TaskGroup{
 		Count: -1,
@@ -413,14 +500,30 @@ func TestTask_Validate_Services(t *testing.T) {
 				Type:    ServiceCheckTCP,
 				Timeout: 2 * time.Second,
 			},
+			{
+				Name:     "check-name",
+				Type:     ServiceCheckTCP,
+				Interval: 1 * time.Second,
+			},
 		},
 	}
 
 	s2 := &Service{
-		Name: "service-name",
+		Name:      "service-name",
+		PortLabel: "bar",
+	}
+
+	s3 := &Service{
+		Name:      "service-A",
+		PortLabel: "a",
+	}
+	s4 := &Service{
+		Name:      "service-A",
+		PortLabel: "b",
 	}
 
 	ephemeralDisk := DefaultEphemeralDisk()
+	ephemeralDisk.SizeMB = 200
 	task := &Task{
 		Name:   "web",
 		Driver: "docker",
@@ -431,14 +534,33 @@ func TestTask_Validate_Services(t *testing.T) {
 		},
 		Services: []*Service{s1, s2},
 	}
-	ephemeralDisk.SizeMB = 200
+
+	task1 := &Task{
+		Name:      "web",
+		Driver:    "docker",
+		Resources: DefaultResources(),
+		Services:  []*Service{s3, s4},
+		LogConfig: DefaultLogConfig(),
+	}
+	task1.Resources.Networks = []*NetworkResource{
+		&NetworkResource{
+			MBits: 10,
+			DynamicPorts: []Port{
+				Port{
+					Label: "a",
+					Value: 1000,
+				},
+				Port{
+					Label: "b",
+					Value: 2000,
+				},
+			},
+		},
+	}
 
 	err := task.Validate(ephemeralDisk)
 	if err == nil {
 		t.Fatal("expected an error")
-	}
-	if !strings.Contains(err.Error(), "referenced by services service-name does not exist") {
-		t.Fatalf("err: %s", err)
 	}
 
 	if !strings.Contains(err.Error(), "service \"service-name\" is duplicate") {
@@ -449,8 +571,16 @@ func TestTask_Validate_Services(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
-	if !strings.Contains(err.Error(), "interval (0s) can not be lower") {
+	if !strings.Contains(err.Error(), "missing required value interval") {
 		t.Fatalf("err: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "cannot be less than") {
+		t.Fatalf("err: %v", err)
+	}
+
+	if err = task1.Validate(ephemeralDisk); err != nil {
+		t.Fatalf("err : %v", err)
 	}
 }
 
@@ -864,7 +994,7 @@ func TestInvalidServiceCheck(t *testing.T) {
 		Name:      "service.name",
 		PortLabel: "bar",
 	}
-	if err := s.Validate(); err == nil {
+	if err := s.ValidateName(s.Name); err == nil {
 		t.Fatalf("Service should be invalid (contains a dot): %v", err)
 	}
 
@@ -877,10 +1007,18 @@ func TestInvalidServiceCheck(t *testing.T) {
 	}
 
 	s = Service{
+		Name:      "my-service-${NOMAD_META_FOO}",
+		PortLabel: "bar",
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("Service should be valid: %v", err)
+	}
+
+	s = Service{
 		Name:      "abcdef0123456789-abcdef0123456789-abcdef0123456789-abcdef0123456",
 		PortLabel: "bar",
 	}
-	if err := s.Validate(); err == nil {
+	if err := s.ValidateName(s.Name); err == nil {
 		t.Fatalf("Service should be invalid (too long): %v", err)
 	}
 
@@ -1163,7 +1301,7 @@ func TestTaskArtifact_Validate_Dest(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	valid.RelativeDest = "local/../.."
+	valid.RelativeDest = "local/../../.."
 	if err := valid.Validate(); err == nil {
 		t.Fatalf("expected error: %v", err)
 	}
@@ -1338,5 +1476,66 @@ func TestVault_Validate(t *testing.T) {
 
 	if err := v.Validate(); err == nil || !strings.Contains(err.Error(), "Signal must") {
 		t.Fatalf("Expected signal empty error")
+	}
+}
+
+func TestConstructorConfig_Validate(t *testing.T) {
+	d := &ConstructorConfig{
+		Payload: "foo",
+	}
+
+	if err := d.Validate(); err == nil || !strings.Contains(err.Error(), "payload") {
+		t.Fatalf("Expected unknown payload requirement: %v", err)
+	}
+
+	d.Payload = DispatchPayloadOptional
+	d.MetaOptional = []string{"foo", "bar"}
+	d.MetaRequired = []string{"bar", "baz"}
+
+	if err := d.Validate(); err == nil || !strings.Contains(err.Error(), "disjoint") {
+		t.Fatalf("Expected meta not being disjoint error: %v", err)
+	}
+}
+
+func TestConstructorConfig_Validate_NonBatch(t *testing.T) {
+	job := testJob()
+	job.Constructor = &ConstructorConfig{
+		Payload: DispatchPayloadOptional,
+	}
+	job.Type = JobTypeSystem
+
+	if err := job.Validate(); err == nil || !strings.Contains(err.Error(), "only be used with") {
+		t.Fatalf("Expected bad scheduler tpye: %v", err)
+	}
+}
+
+func TestConstructorConfig_Canonicalize(t *testing.T) {
+	d := &ConstructorConfig{}
+	d.Canonicalize()
+	if d.Payload != DispatchPayloadOptional {
+		t.Fatalf("Canonicalize failed")
+	}
+}
+
+func TestDispatchInputConfig_Validate(t *testing.T) {
+	d := &DispatchInputConfig{
+		File: "foo",
+	}
+
+	// task/local/haha
+	if err := d.Validate(); err != nil {
+		t.Fatalf("bad: %v", err)
+	}
+
+	// task/haha
+	d.File = "../haha"
+	if err := d.Validate(); err != nil {
+		t.Fatalf("bad: %v", err)
+	}
+
+	// ../haha
+	d.File = "../../../haha"
+	if err := d.Validate(); err == nil {
+		t.Fatalf("bad: %v", err)
 	}
 }

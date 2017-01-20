@@ -89,6 +89,16 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 				Meta: meta,
 			}, nil
 		},
+		"job": func() (cli.Command, error) {
+			return &command.JobCommand{
+				Meta: meta,
+			}, nil
+		},
+		"job dispatch": func() (cli.Command, error) {
+			return &command.JobDispatchCommand{
+				Meta: meta,
+			}, nil
+		},
 		"logs": func() (cli.Command, error) {
 			return &command.LogsCommand{
 				Meta: meta,
@@ -113,11 +123,6 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 
 		"run": func() (cli.Command, error) {
 			return &command.RunCommand{
-				Meta: meta,
-			}, nil
-		},
-		"syslog": func() (cli.Command, error) {
-			return &command.SyslogPluginCommand{
 				Meta: meta,
 			}, nil
 		},

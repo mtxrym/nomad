@@ -147,8 +147,9 @@ func (c *RunCommand) Run(args []string) int {
 		return 1
 	}
 
-	// Check if the job is periodic.
+	// Check if the job is periodic or is a constructor job
 	periodic := job.IsPeriodic()
+	constructor := job.IsConstructor()
 
 	// Parse the Vault token
 	if vaultToken == "" {
@@ -165,6 +166,23 @@ func (c *RunCommand) Run(args []string) int {
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error converting job: %s", err))
 		return 1
+	}
+
+	// COMPAT 0.4.1 -> 0.5 Remove in 0.6
+	if apiJob.TaskGroups != nil {
+	OUTSIDE:
+		for _, tg := range apiJob.TaskGroups {
+			if tg.Tasks != nil {
+				for _, task := range tg.Tasks {
+					if task.Resources != nil {
+						if task.Resources.DiskMB > 0 {
+							c.Ui.Error("WARNING: disk attribute is deprecated in the resources block. See https://www.nomadproject.io/docs/job-specification/ephemeral_disk.html")
+							break OUTSIDE
+						}
+					}
+				}
+			}
+		}
 	}
 
 	if output {
@@ -222,14 +240,14 @@ func (c *RunCommand) Run(args []string) int {
 	}
 
 	// Check if we should enter monitor mode
-	if detach || periodic {
+	if detach || periodic || constructor {
 		c.Ui.Output("Job registration successful")
 		if periodic {
 			now := time.Now().UTC()
 			next := job.Periodic.Next(now)
 			c.Ui.Output(fmt.Sprintf("Approximate next launch time: %s (%s from now)",
 				formatTime(next), formatTimeDifference(now, next, time.Second)))
-		} else {
+		} else if !constructor {
 			c.Ui.Output("Evaluation ID: " + evalID)
 		}
 

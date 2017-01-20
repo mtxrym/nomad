@@ -31,7 +31,7 @@ type FSCommand struct {
 
 func (f *FSCommand) Help() string {
 	helpText := `
-Usage: nomad fs <alloc-id> <path>
+Usage: nomad fs [options] <allocation> <path>
 
   fs displays either the contents of an allocation directory for the passed allocation,
   or displays the file at the given path. The path is relative to the root of the alloc
@@ -59,7 +59,7 @@ FS Specific Options:
     Causes the output to not stop when the end of the file is reached, but rather to
     wait for additional output.
 
-  -tail 
+  -tail
     Show the files contents with offsets relative to the end of the file. If no
     offset is given, -n is defaulted to 10.
 
@@ -298,7 +298,9 @@ func (f *FSCommand) Run(args []string) int {
 		}
 	}
 
-	defer r.Close()
+	if r != nil {
+		defer r.Close()
+	}
 	if readErr != nil {
 		f.Ui.Error(readErr.Error())
 		return 1
@@ -346,7 +348,7 @@ func (f *FSCommand) followFile(client *api.Client, alloc *api.Allocation,
 // but use a dead allocation if no running allocations are found
 func getRandomJobAlloc(client *api.Client, jobID string) (string, error) {
 	var runningAllocs []*api.AllocationListStub
-	allocs, _, err := client.Jobs().Allocations(jobID, nil)
+	allocs, _, err := client.Jobs().Allocations(jobID, false, nil)
 
 	// Check that the job actually has allocations
 	if len(allocs) == 0 {

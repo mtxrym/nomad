@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/client/config"
-	"github.com/hashicorp/nomad/client/driver/env"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/testutil"
 
@@ -45,8 +44,8 @@ func TestRktDriver_Fingerprint(t *testing.T) {
 	}
 
 	ctestutils.RktCompatible(t)
-	driverCtx, _ := testDriverContexts(&structs.Task{Name: "foo"})
-	d := NewRktDriver(driverCtx)
+	ctx := testDriverContexts(t, &structs.Task{Name: "foo", Driver: "rkt"})
+	d := NewRktDriver(ctx.DriverCtx)
 	node := &structs.Node{
 		Attributes: make(map[string]string),
 	}
@@ -76,7 +75,8 @@ func TestRktDriver_Start_DNS(t *testing.T) {
 	ctestutils.RktCompatible(t)
 	// TODO: use test server to load from a fixture
 	task := &structs.Task{
-		Name: "etcd",
+		Name:   "etcd",
+		Driver: "rkt",
 		Config: map[string]interface{}{
 			"trust_prefix":       "coreos.com/etcd",
 			"image":              "coreos.com/etcd:v2.0.4",
@@ -94,12 +94,14 @@ func TestRktDriver_Start_DNS(t *testing.T) {
 		},
 	}
 
-	driverCtx, execCtx := testDriverContexts(task)
-	defer execCtx.AllocDir.Destroy()
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
 
-	d := NewRktDriver(driverCtx)
-
-	handle, err := d.Start(execCtx, task)
+	if err := d.Prestart(ctx.ExecCtx, task); err != nil {
+		t.Fatalf("error in prestart: %v", err)
+	}
+	handle, err := d.Start(ctx.ExecCtx, task)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -109,7 +111,7 @@ func TestRktDriver_Start_DNS(t *testing.T) {
 	defer handle.Kill()
 
 	// Attempt to open
-	handle2, err := d.Open(execCtx, handle.ID())
+	handle2, err := d.Open(ctx.ExecCtx, handle.ID())
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -125,7 +127,8 @@ func TestRktDriver_Start_Wait(t *testing.T) {
 
 	ctestutils.RktCompatible(t)
 	task := &structs.Task{
-		Name: "etcd",
+		Name:   "etcd",
+		Driver: "rkt",
 		Config: map[string]interface{}{
 			"trust_prefix": "coreos.com/etcd",
 			"image":        "coreos.com/etcd:v2.0.4",
@@ -142,11 +145,14 @@ func TestRktDriver_Start_Wait(t *testing.T) {
 		},
 	}
 
-	driverCtx, execCtx := testDriverContexts(task)
-	defer execCtx.AllocDir.Destroy()
-	d := NewRktDriver(driverCtx)
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
 
-	handle, err := d.Start(execCtx, task)
+	if err := d.Prestart(ctx.ExecCtx, task); err != nil {
+		t.Fatalf("error in prestart: %v", err)
+	}
+	handle, err := d.Start(ctx.ExecCtx, task)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -171,7 +177,7 @@ func TestRktDriver_Start_Wait(t *testing.T) {
 		if !res.Successful() {
 			t.Fatalf("err: %v", res)
 		}
-	case <-time.After(time.Duration(testutil.TestMultiplier()*5) * time.Second):
+	case <-time.After(time.Duration(testutil.TestMultiplier()*15) * time.Second):
 		t.Fatalf("timeout")
 	}
 }
@@ -183,7 +189,8 @@ func TestRktDriver_Start_Wait_Skip_Trust(t *testing.T) {
 
 	ctestutils.RktCompatible(t)
 	task := &structs.Task{
-		Name: "etcd",
+		Name:   "etcd",
+		Driver: "rkt",
 		Config: map[string]interface{}{
 			"image":   "coreos.com/etcd:v2.0.4",
 			"command": "/etcd",
@@ -199,11 +206,14 @@ func TestRktDriver_Start_Wait_Skip_Trust(t *testing.T) {
 		},
 	}
 
-	driverCtx, execCtx := testDriverContexts(task)
-	defer execCtx.AllocDir.Destroy()
-	d := NewRktDriver(driverCtx)
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
 
-	handle, err := d.Start(execCtx, task)
+	if err := d.Prestart(ctx.ExecCtx, task); err != nil {
+		t.Fatalf("error in prestart: %v", err)
+	}
+	handle, err := d.Start(ctx.ExecCtx, task)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -223,7 +233,7 @@ func TestRktDriver_Start_Wait_Skip_Trust(t *testing.T) {
 		if !res.Successful() {
 			t.Fatalf("err: %v", res)
 		}
-	case <-time.After(time.Duration(testutil.TestMultiplier()*5) * time.Second):
+	case <-time.After(time.Duration(testutil.TestMultiplier()*15) * time.Second):
 		t.Fatalf("timeout")
 	}
 }
@@ -237,16 +247,25 @@ func TestRktDriver_Start_Wait_AllocDir(t *testing.T) {
 
 	exp := []byte{'w', 'i', 'n'}
 	file := "output.txt"
+	tmpvol, err := ioutil.TempDir("", "nomadtest_rktdriver_volumes")
+	if err != nil {
+		t.Fatalf("error creating temporary dir: %v", err)
+	}
+	defer os.RemoveAll(tmpvol)
+	hostpath := filepath.Join(tmpvol, file)
 
 	task := &structs.Task{
-		Name: "alpine",
+		Name:   "alpine",
+		Driver: "rkt",
 		Config: map[string]interface{}{
 			"image":   "docker://alpine",
 			"command": "/bin/sh",
 			"args": []string{
 				"-c",
-				fmt.Sprintf(`echo -n %s > ${%s}/%s`, string(exp), env.AllocDir, file),
+				fmt.Sprintf(`echo -n %s > foo/%s`, string(exp), file),
 			},
+			"net":     []string{"none"},
+			"volumes": []string{fmt.Sprintf("%s:/foo", tmpvol)},
 		},
 		LogConfig: &structs.LogConfig{
 			MaxFiles:      10,
@@ -258,11 +277,14 @@ func TestRktDriver_Start_Wait_AllocDir(t *testing.T) {
 		},
 	}
 
-	driverCtx, execCtx := testDriverContexts(task)
-	defer execCtx.AllocDir.Destroy()
-	d := NewRktDriver(driverCtx)
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
 
-	handle, err := d.Start(execCtx, task)
+	if err := d.Prestart(ctx.ExecCtx, task); err != nil {
+		t.Fatalf("error in prestart: %v", err)
+	}
+	handle, err := d.Start(ctx.ExecCtx, task)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -276,13 +298,12 @@ func TestRktDriver_Start_Wait_AllocDir(t *testing.T) {
 		if !res.Successful() {
 			t.Fatalf("err: %v", res)
 		}
-	case <-time.After(time.Duration(testutil.TestMultiplier()*5) * time.Second):
+	case <-time.After(time.Duration(testutil.TestMultiplier()*15) * time.Second):
 		t.Fatalf("timeout")
 	}
 
 	// Check that data was written to the shared alloc directory.
-	outputFile := filepath.Join(execCtx.AllocDir.SharedDir, file)
-	act, err := ioutil.ReadFile(outputFile)
+	act, err := ioutil.ReadFile(hostpath)
 	if err != nil {
 		t.Fatalf("Couldn't read expected output: %v", err)
 	}
@@ -299,8 +320,9 @@ func TestRktDriverUser(t *testing.T) {
 
 	ctestutils.RktCompatible(t)
 	task := &structs.Task{
-		Name: "etcd",
-		User: "alice",
+		Name:   "etcd",
+		Driver: "rkt",
+		User:   "alice",
 		Config: map[string]interface{}{
 			"trust_prefix": "coreos.com/etcd",
 			"image":        "coreos.com/etcd:v2.0.4",
@@ -317,11 +339,14 @@ func TestRktDriverUser(t *testing.T) {
 		},
 	}
 
-	driverCtx, execCtx := testDriverContexts(task)
-	defer execCtx.AllocDir.Destroy()
-	d := NewRktDriver(driverCtx)
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
 
-	handle, err := d.Start(execCtx, task)
+	if err := d.Prestart(ctx.ExecCtx, task); err != nil {
+		t.Fatalf("error in prestart: %v", err)
+	}
+	handle, err := d.Start(ctx.ExecCtx, task)
 	if err == nil {
 		handle.Kill()
 		t.Fatalf("Should've failed")
@@ -338,7 +363,8 @@ func TestRktTrustPrefix(t *testing.T) {
 	}
 	ctestutils.RktCompatible(t)
 	task := &structs.Task{
-		Name: "etcd",
+		Name:   "etcd",
+		Driver: "rkt",
 		Config: map[string]interface{}{
 			"trust_prefix": "example.com/invalid",
 			"image":        "coreos.com/etcd:v2.0.4",
@@ -354,12 +380,14 @@ func TestRktTrustPrefix(t *testing.T) {
 			CPU:      100,
 		},
 	}
-	driverCtx, execCtx := testDriverContexts(task)
-	defer execCtx.AllocDir.Destroy()
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
 
-	d := NewRktDriver(driverCtx)
-
-	handle, err := d.Start(execCtx, task)
+	if err := d.Prestart(ctx.ExecCtx, task); err != nil {
+		t.Fatalf("error in prestart: %v", err)
+	}
+	handle, err := d.Start(ctx.ExecCtx, task)
 	if err == nil {
 		handle.Kill()
 		t.Fatalf("Should've failed")
@@ -373,7 +401,8 @@ func TestRktTrustPrefix(t *testing.T) {
 func TestRktTaskValidate(t *testing.T) {
 	ctestutils.RktCompatible(t)
 	task := &structs.Task{
-		Name: "etcd",
+		Name:   "etcd",
+		Driver: "rkt",
 		Config: map[string]interface{}{
 			"trust_prefix":       "coreos.com/etcd",
 			"image":              "coreos.com/etcd:v2.0.4",
@@ -384,11 +413,79 @@ func TestRktTaskValidate(t *testing.T) {
 		},
 		Resources: basicResources,
 	}
-	driverCtx, execCtx := testDriverContexts(task)
-	defer execCtx.AllocDir.Destroy()
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
 
-	d := NewRktDriver(driverCtx)
 	if err := d.Validate(task.Config); err != nil {
 		t.Fatalf("Validation error in TaskConfig : '%v'", err)
+	}
+}
+
+// TODO: Port Mapping test should be ran with proper ACI image and test the port access.
+func TestRktDriver_PortsMapping(t *testing.T) {
+	if os.Getenv("NOMAD_TEST_RKT") == "" {
+		t.Skip("skipping rkt tests")
+	}
+
+	ctestutils.RktCompatible(t)
+	task := &structs.Task{
+		Name:   "etcd",
+		Driver: "rkt",
+		Config: map[string]interface{}{
+			"image": "docker://redis:latest",
+			"args":  []string{"--version"},
+			"port_map": []map[string]string{
+				map[string]string{
+					"main": "6379-tcp",
+				},
+			},
+			"debug": "true",
+		},
+		LogConfig: &structs.LogConfig{
+			MaxFiles:      10,
+			MaxFileSizeMB: 10,
+		},
+		Resources: &structs.Resources{
+			MemoryMB: 256,
+			CPU:      512,
+			Networks: []*structs.NetworkResource{
+				&structs.NetworkResource{
+					IP:            "127.0.0.1",
+					ReservedPorts: []structs.Port{{"main", 8080}},
+				},
+			},
+		},
+	}
+
+	ctx := testDriverContexts(t, task)
+	defer ctx.AllocDir.Destroy()
+	d := NewRktDriver(ctx.DriverCtx)
+
+	if err := d.Prestart(ctx.ExecCtx, task); err != nil {
+		t.Fatalf("error in prestart: %v", err)
+	}
+	handle, err := d.Start(ctx.ExecCtx, task)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if handle == nil {
+		t.Fatalf("missing handle")
+	}
+
+	failCh := make(chan error, 1)
+	go func() {
+		time.Sleep(1 * time.Second)
+		if err := handle.Kill(); err != nil {
+			failCh <- err
+		}
+	}()
+
+	select {
+	case err := <-failCh:
+		t.Fatalf("failed to kill handle: %v", err)
+	case <-handle.WaitCh():
+	case <-time.After(time.Duration(testutil.TestMultiplier()*15) * time.Second):
+		t.Fatalf("timeout")
 	}
 }

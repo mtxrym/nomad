@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/nomad/helper"
+	"github.com/hashicorp/nomad/helper/tlsutil"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/structs/config"
 )
@@ -38,6 +40,19 @@ var (
 		"qemu",
 		"java",
 	}, ",")
+
+	// A mapping of directories on the host OS to attempt to embed inside each
+	// task's chroot.
+	DefaultChrootEnv = map[string]string{
+		"/bin":            "/bin",
+		"/etc":            "/etc",
+		"/lib":            "/lib",
+		"/lib32":          "/lib32",
+		"/lib64":          "/lib64",
+		"/run/resolvconf": "/run/resolvconf",
+		"/sbin":           "/sbin",
+		"/usr":            "/usr",
+	}
 )
 
 // RPCHandler can be provided to the Client if there is a local server
@@ -132,15 +147,21 @@ type Config struct {
 	// PublishAllocationMetrics determines whether nomad is going to publish
 	// allocation metrics to remote Telemetry sinks
 	PublishAllocationMetrics bool
+
+	// TLSConfig holds various TLS related configurations
+	TLSConfig *config.TLSConfig
+
+	// LogLevel is the level of the logs to putout
+	LogLevel string
 }
 
 func (c *Config) Copy() *Config {
 	nc := new(Config)
 	*nc = *c
 	nc.Node = nc.Node.Copy()
-	nc.Servers = structs.CopySliceString(nc.Servers)
-	nc.Options = structs.CopyMapStringString(nc.Options)
-	nc.GloballyReservedPorts = structs.CopySliceInt(c.GloballyReservedPorts)
+	nc.Servers = helper.CopySliceString(nc.Servers)
+	nc.Options = helper.CopyMapStringString(nc.Options)
+	nc.GloballyReservedPorts = helper.CopySliceInt(c.GloballyReservedPorts)
 	nc.ConsulConfig = c.ConsulConfig.Copy()
 	nc.VaultConfig = c.VaultConfig.Copy()
 	return nc
@@ -154,6 +175,8 @@ func DefaultConfig() *Config {
 		LogOutput:               os.Stderr,
 		Region:                  "global",
 		StatsCollectionInterval: 1 * time.Second,
+		TLSConfig:               &config.TLSConfig{},
+		LogLevel:                "DEBUG",
 	}
 }
 
@@ -225,4 +248,17 @@ func (c *Config) ReadStringListToMapDefault(key, defaultValue string) map[string
 		}
 	}
 	return list
+}
+
+// TLSConfig returns a TLSUtil Config based on the client configuration
+func (c *Config) TLSConfiguration() *tlsutil.Config {
+	tlsConf := &tlsutil.Config{
+		VerifyIncoming:       true,
+		VerifyOutgoing:       true,
+		VerifyServerHostname: c.TLSConfig.VerifyServerHostname,
+		CAFile:               c.TLSConfig.CAFile,
+		CertFile:             c.TLSConfig.CertFile,
+		KeyFile:              c.TLSConfig.KeyFile,
+	}
+	return tlsConf
 }

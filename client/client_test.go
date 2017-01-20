@@ -1,7 +1,10 @@
 package client
 
 import (
+	"archive/tar"
+	"bytes"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -91,6 +94,11 @@ func testClient(t *testing.T, cb func(c *config.Config)) *Client {
 	conf := config.DefaultConfig()
 	conf.VaultConfig.Enabled = &f
 	conf.DevMode = true
+	conf.Node = &structs.Node{
+		Reserved: &structs.Resources{
+			DiskMB: 0,
+		},
+	}
 	if cb != nil {
 		cb(conf)
 	}
@@ -163,8 +171,8 @@ func TestClient_Fingerprint(t *testing.T) {
 	if node.Attributes["kernel.name"] == "" {
 		t.Fatalf("missing kernel.name")
 	}
-	if node.Attributes["arch"] == "" {
-		t.Fatalf("missing arch")
+	if node.Attributes["cpu.arch"] == "" {
+		t.Fatalf("missing cpu arch")
 	}
 }
 
@@ -216,6 +224,23 @@ func TestClient_Fingerprint_InWhitelist(t *testing.T) {
 	}
 }
 
+func TestClient_Fingerprint_InBlacklist(t *testing.T) {
+	c := testClient(t, func(c *config.Config) {
+		if c.Options == nil {
+			c.Options = make(map[string]string)
+		}
+
+		// Weird spacing to test trimming. Blacklist cpu.
+		c.Options["fingerprint.blacklist"] = "  cpu	"
+	})
+	defer c.Shutdown()
+
+	node := c.Node()
+	if node.Attributes["cpu.frequency"] != "" {
+		t.Fatalf("cpu fingerprint module loaded despite blacklisting")
+	}
+}
+
 func TestClient_Fingerprint_OutOfWhitelist(t *testing.T) {
 	c := testClient(t, func(c *config.Config) {
 		if c.Options == nil {
@@ -229,6 +254,35 @@ func TestClient_Fingerprint_OutOfWhitelist(t *testing.T) {
 	node := c.Node()
 	if node.Attributes["cpu.frequency"] != "" {
 		t.Fatalf("found cpu fingerprint module")
+	}
+}
+
+func TestClient_Fingerprint_WhitelistBlacklistCombination(t *testing.T) {
+	c := testClient(t, func(c *config.Config) {
+		if c.Options == nil {
+			c.Options = make(map[string]string)
+		}
+
+		// With both white- and blacklist, should return the set difference of modules (arch, cpu)
+		c.Options["fingerprint.whitelist"] = "arch,memory,cpu"
+		c.Options["fingerprint.blacklist"] = "memory,nomad"
+	})
+	defer c.Shutdown()
+
+	node := c.Node()
+	// Check expected modules are present
+	if node.Attributes["cpu.frequency"] == "" {
+		t.Fatalf("missing cpu fingerprint module")
+	}
+	if node.Attributes["cpu.arch"] == "" {
+		t.Fatalf("missing arch fingerprint module")
+	}
+	// Check remainder _not_ present
+	if node.Attributes["memory.totalbytes"] != "" {
+		t.Fatalf("found memory fingerprint module")
+	}
+	if node.Attributes["nomad.version"] != "" {
+		t.Fatalf("found nomad fingerprint module")
 	}
 }
 
@@ -267,6 +321,27 @@ func TestClient_Drivers_InWhitelist(t *testing.T) {
 	}
 }
 
+func TestClient_Drivers_InBlacklist(t *testing.T) {
+	c := testClient(t, func(c *config.Config) {
+		if c.Options == nil {
+			c.Options = make(map[string]string)
+		}
+
+		// Weird spacing to test trimming
+		c.Options["driver.blacklist"] = "   exec ,  foo	"
+	})
+	defer c.Shutdown()
+
+	node := c.Node()
+	if node.Attributes["driver.exec"] != "" {
+		if v, ok := osExecDriverSupport[runtime.GOOS]; !v && ok {
+			t.Fatalf("exec driver loaded despite blacklist")
+		} else {
+			t.Skipf("missing exec driver, no OS support")
+		}
+	}
+}
+
 func TestClient_Drivers_OutOfWhitelist(t *testing.T) {
 	c := testClient(t, func(c *config.Config) {
 		if c.Options == nil {
@@ -280,6 +355,29 @@ func TestClient_Drivers_OutOfWhitelist(t *testing.T) {
 	node := c.Node()
 	if node.Attributes["driver.exec"] != "" {
 		t.Fatalf("found exec driver")
+	}
+}
+
+func TestClient_Drivers_WhitelistBlacklistCombination(t *testing.T) {
+	c := testClient(t, func(c *config.Config) {
+		if c.Options == nil {
+			c.Options = make(map[string]string)
+		}
+
+		// Expected output is set difference (raw_exec)
+		c.Options["driver.whitelist"] = "raw_exec,exec"
+		c.Options["driver.blacklist"] = "exec"
+	})
+	defer c.Shutdown()
+
+	node := c.Node()
+	// Check expected present
+	if node.Attributes["driver.raw_exec"] == "" {
+		t.Fatalf("missing raw_exec driver")
+	}
+	// Check expected absent
+	if node.Attributes["driver.exec"] != "" {
+		t.Fatalf("exec driver loaded despite blacklist")
 	}
 }
 
@@ -581,12 +679,13 @@ func TestClient_SaveRestoreState(t *testing.T) {
 	})
 
 	// Destroy all the allocations
-	c2.allocLock.Lock()
-	for _, ar := range c2.allocs {
+	for _, ar := range c2.getAllocRunners() {
 		ar.Destroy()
+	}
+
+	for _, ar := range c2.getAllocRunners() {
 		<-ar.WaitCh()
 	}
-	c2.allocLock.Unlock()
 }
 
 func TestClient_Init(t *testing.T) {
@@ -706,11 +805,119 @@ func TestClient_BlockedAllocations(t *testing.T) {
 	})
 
 	// Destroy all the allocations
-	c1.allocLock.Lock()
-	for _, ar := range c1.allocs {
+	for _, ar := range c1.getAllocRunners() {
 		ar.Destroy()
+	}
+
+	for _, ar := range c1.getAllocRunners() {
 		<-ar.WaitCh()
 	}
-	c1.allocLock.Unlock()
+}
 
+func TestClient_UnarchiveAllocDir(t *testing.T) {
+	dir, err := ioutil.TempDir("", "")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	if err := os.Mkdir(filepath.Join(dir, "foo"), 0777); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	dirInfo, err := os.Stat(filepath.Join(dir, "foo"))
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	f, err := os.Create(filepath.Join(dir, "foo", "bar"))
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if _, err := f.WriteString("foo"); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if err := f.Chmod(0644); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	fInfo, err := f.Stat()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	f.Close()
+
+	buf := new(bytes.Buffer)
+	tw := tar.NewWriter(buf)
+
+	walkFn := func(path string, fileInfo os.FileInfo, err error) error {
+		// Ignore if the file is a symlink
+		if fileInfo.Mode() == os.ModeSymlink {
+			return nil
+		}
+
+		// Include the path of the file name relative to the alloc dir
+		// so that we can put the files in the right directories
+		hdr, err := tar.FileInfoHeader(fileInfo, "")
+		if err != nil {
+			return fmt.Errorf("error creating file header: %v", err)
+		}
+		hdr.Name = fileInfo.Name()
+		tw.WriteHeader(hdr)
+
+		// If it's a directory we just write the header into the tar
+		if fileInfo.IsDir() {
+			return nil
+		}
+
+		// Write the file into the archive
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		if _, err := io.Copy(tw, file); err != nil {
+			return err
+		}
+
+		return nil
+	}
+
+	if err := filepath.Walk(dir, walkFn); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	tw.Close()
+
+	dir1, err := ioutil.TempDir("", "")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer os.RemoveAll(dir1)
+
+	c1 := testClient(t, func(c *config.Config) {
+		c.RPCHandler = nil
+	})
+	defer c1.Shutdown()
+
+	rc := ioutil.NopCloser(buf)
+
+	c1.migratingAllocs["123"] = make(chan struct{})
+	if err := c1.unarchiveAllocDir(rc, "123", dir1); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Ensure foo is present
+	fi, err := os.Stat(filepath.Join(dir1, "foo"))
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if fi.Mode() != dirInfo.Mode() {
+		t.Fatalf("mode: %v", fi.Mode())
+	}
+
+	fi1, err := os.Stat(filepath.Join(dir1, "bar"))
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if fi1.Mode() != fInfo.Mode() {
+		t.Fatalf("mode: %v", fi1.Mode())
+	}
 }

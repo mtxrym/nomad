@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"reflect"
 	"time"
 
 	"github.com/armon/go-metrics"
@@ -235,7 +236,7 @@ func (n *nomadFSM) applyUpsertJob(buf []byte, index uint64) interface{} {
 		panic(fmt.Errorf("failed to decode request: %v", err))
 	}
 
-	// COMPAT: Remove in 0.5
+	// COMPAT: Remove in 0.6
 	// Empty maps and slices should be treated as nil to avoid
 	// un-intended destructive updates in scheduler since we use
 	// reflect.DeepEqual. Starting Nomad 0.4.1, job submission sanatizes
@@ -350,6 +351,11 @@ func (n *nomadFSM) applyUpdateEval(buf []byte, index uint64) interface{} {
 			n.evalBroker.Enqueue(eval)
 		} else if eval.ShouldBlock() {
 			n.blockedEvals.Block(eval)
+		} else if eval.Status == structs.EvalStatusComplete &&
+			len(eval.FailedTGAllocs) == 0 {
+			// If we have a successful evaluation for a node, untrack any
+			// blocked evaluation
+			n.blockedEvals.Untrack(eval.JobID)
 		}
 	}
 	return nil
@@ -723,10 +729,11 @@ func (n *nomadFSM) reconcileQueuedAllocations(index uint64) error {
 		}
 
 		// Get the job summary from the fsm state store
-		summary, err := n.state.JobSummaryByID(job.ID)
+		originalSummary, err := n.state.JobSummaryByID(job.ID)
 		if err != nil {
 			return err
 		}
+		summary := originalSummary.Copy()
 
 		// Add the allocations scheduler has made to queued since these
 		// allocations are never getting placed until the scheduler is invoked
@@ -755,12 +762,19 @@ func (n *nomadFSM) reconcileQueuedAllocations(index uint64) error {
 			if !ok {
 				return fmt.Errorf("task group %q not found while updating queued count", tg)
 			}
+
+			// We add instead of setting here because we want to take into
+			// consideration what the scheduler with a mock planner thinks it
+			// placed. Those should be counted as queued as well
 			tgSummary.Queued += queued
 			summary.Summary[tg] = tgSummary
 		}
 
-		if err := n.state.UpsertJobSummary(index, summary); err != nil {
-			return err
+		if !reflect.DeepEqual(summary, originalSummary) {
+			summary.ModifyIndex = index
+			if err := n.state.UpsertJobSummary(index, summary); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -997,7 +1011,7 @@ func (s *nomadSnapshot) persistJobSummaries(sink raft.SnapshotSink,
 			break
 		}
 
-		jobSummary := raw.(structs.JobSummary)
+		jobSummary := raw.(*structs.JobSummary)
 
 		sink.Write([]byte{byte(JobSummarySnapshot)})
 		if err := encoder.Encode(jobSummary); err != nil {

@@ -328,8 +328,12 @@ func shuffleNodes(nodes []*structs.Node) {
 }
 
 // tasksUpdated does a diff between task groups to see if the
-// tasks, their drivers, environment variables or config have updated.
-func tasksUpdated(a, b *structs.TaskGroup) bool {
+// tasks, their drivers, environment variables or config have updated. The
+// inputs are the task group name to diff and two jobs to diff.
+func tasksUpdated(jobA, jobB *structs.Job, taskGroup string) bool {
+	a := jobA.LookupTaskGroup(taskGroup)
+	b := jobB.LookupTaskGroup(taskGroup)
+
 	// If the number of tasks do not match, clearly there is an update
 	if len(a.Tasks) != len(b.Tasks) {
 		return true
@@ -358,9 +362,6 @@ func tasksUpdated(a, b *structs.TaskGroup) bool {
 		if !reflect.DeepEqual(at.Env, bt.Env) {
 			return true
 		}
-		if !reflect.DeepEqual(at.Meta, bt.Meta) {
-			return true
-		}
 		if !reflect.DeepEqual(at.Artifacts, bt.Artifacts) {
 			return true
 		}
@@ -368,6 +369,13 @@ func tasksUpdated(a, b *structs.TaskGroup) bool {
 			return true
 		}
 		if !reflect.DeepEqual(at.Templates, bt.Templates) {
+			return true
+		}
+
+		// Check the metadata
+		if !reflect.DeepEqual(
+			jobA.CombinedTaskMeta(taskGroup, at.Name),
+			jobB.CombinedTaskMeta(taskGroup, bt.Name)) {
 			return true
 		}
 
@@ -452,8 +460,13 @@ func inplaceUpdate(ctx Context, eval *structs.Evaluation, job *structs.Job,
 
 		// Check if the task drivers or config has changed, requires
 		// a rolling upgrade since that cannot be done in-place.
-		existing := update.Alloc.Job.LookupTaskGroup(update.TaskGroup.Name)
-		if tasksUpdated(update.TaskGroup, existing) {
+		//existing := update.Alloc.Job.LookupTaskGroup(update.TaskGroup.Name)
+		//if tasksUpdated(update.TaskGroup, existing) {
+		//continue
+		//}
+
+		existing := update.Alloc.Job
+		if tasksUpdated(job, existing, update.TaskGroup.Name) {
 			continue
 		}
 
@@ -671,8 +684,14 @@ func adjustQueuedAllocations(logger *log.Logger, result *structs.PlanResult, que
 	if result != nil {
 		for _, allocations := range result.NodeAllocation {
 			for _, allocation := range allocations {
-				// Ensure that the allocation is newly created
-				if allocation.CreateIndex != result.AllocIndex {
+				// Ensure that the allocation is newly created. We check that
+				// the CreateIndex is equal to the ModifyIndex in order to check
+				// that the allocation was just created. We do not check that
+				// the CreateIndex is equal to the results AllocIndex because
+				// the allocations we get back have gone through the planner's
+				// optimistic snapshot and thus their indexes may not be
+				// correct, but they will be consistent.
+				if allocation.CreateIndex != allocation.ModifyIndex {
 					continue
 				}
 

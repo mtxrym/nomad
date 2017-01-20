@@ -18,6 +18,12 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
+const (
+	// hostSrcOption is the Client option that determines whether the template
+	// source may be from the host
+	hostSrcOption = "template.allow_host_source"
+)
+
 var (
 	// testRetryRate is used to speed up tests by setting consul-templates retry
 	// rate to something low
@@ -36,8 +42,9 @@ type TaskHooks interface {
 	// called after prestart work is completed
 	UnblockStart(source string)
 
-	// Kill is used to kill the task because of the passed error.
-	Kill(source, reason string)
+	// Kill is used to kill the task because of the passed error. If fail is set
+	// to true, the task is marked as failed
+	Kill(source, reason string, fail bool)
 }
 
 // TaskTemplateManager is used to run a set of templates for a given task
@@ -47,9 +54,6 @@ type TaskTemplateManager struct {
 
 	// lookup allows looking up the set of Nomad templates by their consul-template ID
 	lookup map[string][]*structs.Template
-
-	// allRendered marks whether all the templates have been rendered
-	allRendered bool
 
 	// hooks is used to signal/restart the task as templates are rendered
 	hook TaskHooks
@@ -70,7 +74,7 @@ type TaskTemplateManager struct {
 }
 
 func NewTaskTemplateManager(hook TaskHooks, tmpls []*structs.Template,
-	allRendered bool, config *config.Config, vaultToken, taskDir string,
+	config *config.Config, vaultToken, taskDir string,
 	taskEnv *env.TaskEnvironment) (*TaskTemplateManager, error) {
 
 	// Check pre-conditions
@@ -85,10 +89,9 @@ func NewTaskTemplateManager(hook TaskHooks, tmpls []*structs.Template,
 	}
 
 	tm := &TaskTemplateManager{
-		templates:   tmpls,
-		allRendered: allRendered,
-		hook:        hook,
-		shutdownCh:  make(chan struct{}),
+		templates:  tmpls,
+		hook:       hook,
+		shutdownCh: make(chan struct{}),
 	}
 
 	// Parse the signals that we need
@@ -144,10 +147,7 @@ func (tm *TaskTemplateManager) run() {
 	// Runner is nil if there is no templates
 	if tm.runner == nil {
 		// Unblock the start if there is nothing to do
-		if !tm.allRendered {
-			tm.hook.UnblockStart("consul-template")
-		}
-
+		tm.hook.UnblockStart("consul-template")
 		return
 	}
 
@@ -159,46 +159,40 @@ func (tm *TaskTemplateManager) run() {
 	var allRenderedTime time.Time
 
 	// Handle the first rendering
-	if !tm.allRendered {
-		// Wait till all the templates have been rendered
-	WAIT:
-		for {
-			select {
-			case <-tm.shutdownCh:
-				return
-			case err, ok := <-tm.runner.ErrCh:
-				if !ok {
-					continue
-				}
-
-				tm.hook.Kill("consul-template", err.Error())
-			case <-tm.runner.TemplateRenderedCh():
-				// A template has been rendered, figure out what to do
-				events := tm.runner.RenderEvents()
-
-				// Not all templates have been rendered yet
-				if len(events) < len(tm.lookup) {
-					continue
-				}
-
-				for _, event := range events {
-					// This template hasn't been rendered
-					if event.LastDidRender.IsZero() {
-						continue WAIT
-					}
-				}
-
-				break WAIT
+	// Wait till all the templates have been rendered
+WAIT:
+	for {
+		select {
+		case <-tm.shutdownCh:
+			return
+		case err, ok := <-tm.runner.ErrCh:
+			if !ok {
+				continue
 			}
 
-			// TODO Thinking, I believe we could check every 30 seconds and if
-			// they are all would be rendered we should start anyways. That is
-			// the reattach mechanism when they have all been rendered
-		}
+			tm.hook.Kill("consul-template", err.Error(), true)
+		case <-tm.runner.TemplateRenderedCh():
+			// A template has been rendered, figure out what to do
+			events := tm.runner.RenderEvents()
 
-		allRenderedTime = time.Now()
-		tm.hook.UnblockStart("consul-template")
+			// Not all templates have been rendered yet
+			if len(events) < len(tm.lookup) {
+				continue
+			}
+
+			for _, event := range events {
+				// This template hasn't been rendered
+				if event.LastWouldRender.IsZero() {
+					continue WAIT
+				}
+			}
+
+			break WAIT
+		}
 	}
+
+	allRenderedTime = time.Now()
+	tm.hook.UnblockStart("consul-template")
 
 	// If all our templates are change mode no-op, then we can exit here
 	if tm.allTemplatesNoop() {
@@ -218,7 +212,7 @@ func (tm *TaskTemplateManager) run() {
 				continue
 			}
 
-			tm.hook.Kill("consul-template", err.Error())
+			tm.hook.Kill("consul-template", err.Error(), true)
 		case <-tm.runner.TemplateRenderedCh():
 			// A template has been rendered, figure out what to do
 			var handling []string
@@ -226,24 +220,24 @@ func (tm *TaskTemplateManager) run() {
 			restart := false
 			var splay time.Duration
 
-			now := time.Now()
-			for id, event := range tm.runner.RenderEvents() {
+			events := tm.runner.RenderEvents()
+			for id, event := range events {
 
 				// First time through
-				if allRenderedTime.After(event.LastDidRender) {
-					handledRenders[id] = now
+				if allRenderedTime.After(event.LastDidRender) || allRenderedTime.Equal(event.LastDidRender) {
+					handledRenders[id] = allRenderedTime
 					continue
 				}
 
 				// We have already handled this one
-				if htime := handledRenders[id]; htime.After(event.LastDidRender) {
+				if htime := handledRenders[id]; htime.After(event.LastDidRender) || htime.Equal(event.LastDidRender) {
 					continue
 				}
 
 				// Lookup the template and determine what to do
 				tmpls, ok := tm.lookup[id]
 				if !ok {
-					tm.hook.Kill("consul-template", fmt.Sprintf("consul-template runner returned unknown template id %q", id))
+					tm.hook.Kill("consul-template", fmt.Sprintf("consul-template runner returned unknown template id %q", id), true)
 					return
 				}
 
@@ -275,9 +269,8 @@ func (tm *TaskTemplateManager) run() {
 				}
 
 				// Update handle time
-				now = time.Now()
 				for _, id := range handling {
-					handledRenders[id] = now
+					handledRenders[id] = events[id].LastDidRender
 				}
 
 				if restart {
@@ -296,7 +289,7 @@ func (tm *TaskTemplateManager) run() {
 						for signal := range signals {
 							flat = append(flat, tm.signals[signal])
 						}
-						tm.hook.Kill("consul-template", fmt.Sprintf("Sending signals %v failed: %v", flat, err))
+						tm.hook.Kill("consul-template", fmt.Sprintf("Sending signals %v failed: %v", flat, err), true)
 					}
 				}
 			}
@@ -332,7 +325,11 @@ func templateRunner(tmpls []*structs.Template, config *config.Config,
 	}
 
 	// Parse the templates
-	ctmplMapping := parseTemplateConfigs(tmpls, taskDir, taskEnv)
+	allowAbs := config.ReadBoolDefault(hostSrcOption, true)
+	ctmplMapping, err := parseTemplateConfigs(tmpls, taskDir, taskEnv, allowAbs)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	// Set the config
 	flat := make([]*ctconf.ConfigTemplate, 0, len(ctmplMapping))
@@ -362,7 +359,8 @@ func templateRunner(tmpls []*structs.Template, config *config.Config,
 }
 
 // parseTemplateConfigs converts the tasks templates into consul-templates
-func parseTemplateConfigs(tmpls []*structs.Template, taskDir string, taskEnv *env.TaskEnvironment) map[ctconf.ConfigTemplate]*structs.Template {
+func parseTemplateConfigs(tmpls []*structs.Template, taskDir string,
+	taskEnv *env.TaskEnvironment, allowAbs bool) (map[ctconf.ConfigTemplate]*structs.Template, error) {
 	// Build the task environment
 	// TODO Should be able to inject the Nomad env vars into Consul-template for
 	// rendering
@@ -372,7 +370,15 @@ func parseTemplateConfigs(tmpls []*structs.Template, taskDir string, taskEnv *en
 	for _, tmpl := range tmpls {
 		var src, dest string
 		if tmpl.SourcePath != "" {
-			src = filepath.Join(taskDir, taskEnv.ReplaceEnv(tmpl.SourcePath))
+			if filepath.IsAbs(tmpl.SourcePath) {
+				if !allowAbs {
+					return nil, fmt.Errorf("Specifying absolute template paths disallowed by client config: %q", tmpl.SourcePath)
+				}
+
+				src = tmpl.SourcePath
+			} else {
+				src = filepath.Join(taskDir, taskEnv.ReplaceEnv(tmpl.SourcePath))
+			}
 		}
 		if tmpl.DestPath != "" {
 			dest = filepath.Join(taskDir, taskEnv.ReplaceEnv(tmpl.DestPath))
@@ -389,7 +395,7 @@ func parseTemplateConfigs(tmpls []*structs.Template, taskDir string, taskEnv *en
 		ctmpls[ct] = tmpl
 	}
 
-	return ctmpls
+	return ctmpls, nil
 }
 
 // runnerConfig returns a consul-template runner configuration, setting the
@@ -414,10 +420,10 @@ func runnerConfig(config *config.Config, vaultToken string) (*ctconf.Config, err
 		conf.Token = config.ConsulConfig.Token
 		set([]string{"consul", "token"})
 
-		if config.ConsulConfig.EnableSSL {
+		if config.ConsulConfig.EnableSSL != nil && *config.ConsulConfig.EnableSSL {
 			conf.SSL = &ctconf.SSLConfig{
 				Enabled: true,
-				Verify:  config.ConsulConfig.VerifySSL,
+				Verify:  *config.ConsulConfig.VerifySSL,
 				Cert:    config.ConsulConfig.CertFile,
 				Key:     config.ConsulConfig.KeyFile,
 				CaCert:  config.ConsulConfig.CAFile,
@@ -442,13 +448,15 @@ func runnerConfig(config *config.Config, vaultToken string) (*ctconf.Config, err
 	}
 
 	// Setup the Vault config
+	// Always set these to ensure nothing is picked up from the environment
+	conf.Vault = &ctconf.VaultConfig{
+		RenewToken: false,
+	}
+	set([]string{"vault", "vault.token", "vault.renew_token"})
 	if config.VaultConfig != nil && config.VaultConfig.IsEnabled() {
-		conf.Vault = &ctconf.VaultConfig{
-			Address:    config.VaultConfig.Addr,
-			Token:      vaultToken,
-			RenewToken: false,
-		}
-		set([]string{"vault", "vault.address", "vault.token", "vault.renew_token"})
+		conf.Vault.Address = config.VaultConfig.Addr
+		conf.Vault.Token = vaultToken
+		set([]string{"vault.address"})
 
 		if strings.HasPrefix(config.VaultConfig.Addr, "https") || config.VaultConfig.TLSCertFile != "" {
 			verify := config.VaultConfig.TLSSkipVerify == nil || !*config.VaultConfig.TLSSkipVerify
@@ -458,7 +466,7 @@ func runnerConfig(config *config.Config, vaultToken string) (*ctconf.Config, err
 				Cert:    config.VaultConfig.TLSCertFile,
 				Key:     config.VaultConfig.TLSKeyFile,
 				CaCert:  config.VaultConfig.TLSCaFile,
-				// TODO need to add this to consul-template: CaPath: config.VaultConfig.TLSCaPath,
+				CaPath:  config.VaultConfig.TLSCaPath,
 			}
 
 			set([]string{"vault.ssl", "vault.ssl.enabled", "vault.ssl.verify",

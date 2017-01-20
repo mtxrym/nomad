@@ -1,10 +1,11 @@
 package driver
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
+	"strings"
 
 	"github.com/hashicorp/nomad/client/allocdir"
 	"github.com/hashicorp/nomad/client/config"
@@ -16,16 +17,22 @@ import (
 	cstructs "github.com/hashicorp/nomad/client/structs"
 )
 
-// BuiltinDrivers contains the built in registered drivers
-// which are available for allocation handling
-var BuiltinDrivers = map[string]Factory{
-	"docker":   NewDockerDriver,
-	"exec":     NewExecDriver,
-	"raw_exec": NewRawExecDriver,
-	"java":     NewJavaDriver,
-	"qemu":     NewQemuDriver,
-	"rkt":      NewRktDriver,
-}
+var (
+	// BuiltinDrivers contains the built in registered drivers
+	// which are available for allocation handling
+	BuiltinDrivers = map[string]Factory{
+		"docker":   NewDockerDriver,
+		"exec":     NewExecDriver,
+		"raw_exec": NewRawExecDriver,
+		"java":     NewJavaDriver,
+		"qemu":     NewQemuDriver,
+		"rkt":      NewRktDriver,
+	}
+
+	// DriverStatsNotImplemented is the error to be returned if a driver doesn't
+	// implement stats.
+	DriverStatsNotImplemented = errors.New("stats not implemented for driver")
+)
 
 // NewDriver is used to instantiate and return a new driver
 // given the name and a logger
@@ -51,6 +58,10 @@ type Driver interface {
 	// Drivers must support the fingerprint interface for detection
 	fingerprint.Fingerprint
 
+	// Prestart prepares the task environment and performs expensive
+	// intialization steps like downloading images.
+	Prestart(*ExecContext, *structs.Task) error
+
 	// Start is used to being task execution
 	Start(ctx *ExecContext, task *structs.Task) (DriverHandle, error)
 
@@ -59,7 +70,22 @@ type Driver interface {
 
 	// Drivers must validate their configuration
 	Validate(map[string]interface{}) error
+
+	// Abilities returns the abilities of the driver
+	Abilities() DriverAbilities
+
+	// FSIsolation returns the method of filesystem isolation used
+	FSIsolation() cstructs.FSIsolation
 }
+
+// DriverAbilities marks the abilities the driver has.
+type DriverAbilities struct {
+	// SendSignals marks the driver as being able to send signals
+	SendSignals bool
+}
+
+// LogEventFn is a callback which allows Drivers to emit task events.
+type LogEventFn func(message string, args ...interface{})
 
 // DriverContext is a means to inject dependencies such as loggers, configs, and
 // node attributes into a Driver without having to change the Driver interface
@@ -70,18 +96,14 @@ type DriverContext struct {
 	logger   *log.Logger
 	node     *structs.Node
 	taskEnv  *env.TaskEnvironment
+
+	emitEvent LogEventFn
 }
 
 // NewEmptyDriverContext returns a DriverContext with all fields set to their
 // zero value.
 func NewEmptyDriverContext() *DriverContext {
-	return &DriverContext{
-		taskName: "",
-		config:   nil,
-		node:     nil,
-		logger:   nil,
-		taskEnv:  nil,
-	}
+	return &DriverContext{}
 }
 
 // NewDriverContext initializes a new DriverContext with the specified fields.
@@ -89,13 +111,14 @@ func NewEmptyDriverContext() *DriverContext {
 // private to the driver. If we want to change this later we can gorename all of
 // the fields in DriverContext.
 func NewDriverContext(taskName string, config *config.Config, node *structs.Node,
-	logger *log.Logger, taskEnv *env.TaskEnvironment) *DriverContext {
+	logger *log.Logger, taskEnv *env.TaskEnvironment, eventEmitter LogEventFn) *DriverContext {
 	return &DriverContext{
-		taskName: taskName,
-		config:   config,
-		node:     node,
-		logger:   logger,
-		taskEnv:  taskEnv,
+		taskName:  taskName,
+		config:    config,
+		node:      node,
+		logger:    logger,
+		taskEnv:   taskEnv,
+		emitEvent: eventEmitter,
 	}
 }
 
@@ -122,43 +145,51 @@ type DriverHandle interface {
 	Signal(s os.Signal) error
 }
 
-// ExecContext is shared between drivers within an allocation
+// ExecContext is a task's execution context
 type ExecContext struct {
-	// AllocDir contains information about the alloc directory structure.
-	AllocDir *allocdir.AllocDir
+	// TaskDir contains information about the task directory structure.
+	TaskDir *allocdir.TaskDir
 
 	// Alloc ID
 	AllocID string
 }
 
 // NewExecContext is used to create a new execution context
-func NewExecContext(alloc *allocdir.AllocDir, allocID string) *ExecContext {
-	return &ExecContext{AllocDir: alloc, AllocID: allocID}
+func NewExecContext(td *allocdir.TaskDir, allocID string) *ExecContext {
+	return &ExecContext{
+		TaskDir: td,
+		AllocID: allocID,
+	}
 }
 
 // GetTaskEnv converts the alloc dir, the node, task and alloc into a
 // TaskEnvironment.
-func GetTaskEnv(allocDir *allocdir.AllocDir, node *structs.Node,
-	task *structs.Task, alloc *structs.Allocation, vaultToken string) (*env.TaskEnvironment, error) {
+func GetTaskEnv(taskDir *allocdir.TaskDir, node *structs.Node,
+	task *structs.Task, alloc *structs.Allocation, conf *config.Config,
+	vaultToken string) (*env.TaskEnvironment, error) {
 
-	tg := alloc.Job.LookupTaskGroup(alloc.TaskGroup)
 	env := env.NewTaskEnvironment(node).
-		SetTaskMeta(task.Meta).
-		SetTaskGroupMeta(tg.Meta).
-		SetJobMeta(alloc.Job.Meta).
+		SetTaskMeta(alloc.Job.CombinedTaskMeta(alloc.TaskGroup, task.Name)).
 		SetJobName(alloc.Job.Name).
 		SetEnvvars(task.Env).
 		SetTaskName(task.Name)
 
-	if allocDir != nil {
-		env.SetAllocDir(allocDir.SharedDir)
-		taskdir, ok := allocDir.TaskDirs[task.Name]
-		if !ok {
-			return nil, fmt.Errorf("failed to get task directory for task %q", task.Name)
-		}
-
-		env.SetTaskLocalDir(filepath.Join(taskdir, allocdir.TaskLocal))
-		env.SetSecretDir(filepath.Join(taskdir, allocdir.TaskSecrets))
+	// Vary paths by filesystem isolation used
+	drv, err := NewDriver(task.Driver, NewEmptyDriverContext())
+	if err != nil {
+		return nil, err
+	}
+	switch drv.FSIsolation() {
+	case cstructs.FSIsolationNone:
+		// Use host paths
+		env.SetAllocDir(taskDir.SharedAllocDir)
+		env.SetTaskLocalDir(taskDir.LocalDir)
+		env.SetSecretsDir(taskDir.SecretsDir)
+	default:
+		// filesystem isolation; use container paths
+		env.SetAllocDir(allocdir.SharedAllocContainerPath)
+		env.SetTaskLocalDir(allocdir.TaskLocalContainerPath)
+		env.SetSecretsDir(allocdir.TaskSecretsContainerPath)
 	}
 
 	if task.Resources != nil {
@@ -174,6 +205,10 @@ func GetTaskEnv(allocDir *allocdir.AllocDir, node *structs.Node,
 	if task.Vault != nil {
 		env.SetVaultToken(vaultToken, task.Vault.Env)
 	}
+
+	// Set the host environment variables.
+	filter := strings.Split(conf.ReadDefault("env.blacklist", config.DefaultEnvBlacklist), ",")
+	env.AppendHostEnvvars(filter)
 
 	return env.Build(), nil
 }

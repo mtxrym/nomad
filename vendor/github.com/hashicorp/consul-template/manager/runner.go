@@ -427,7 +427,7 @@ func (r *Runner) Signal(s os.Signal) error {
 func (r *Runner) Run() error {
 	log.Printf("[INFO] (runner) running")
 
-	var renderedAny bool
+	var wouldRenderAny, renderedAny bool
 	var commands []*config.ConfigTemplate
 	depsMap := make(map[string]dep.Dependency)
 
@@ -541,6 +541,9 @@ func (r *Runner) Run() error {
 				// Make a note that we have rendered this template (required for once
 				// mode and just generally nice for debugging purposes).
 				r.markRenderTime(tmpl.ID(), false)
+
+				// Record that at least one template would have been rendered.
+				wouldRenderAny = true
 			}
 
 			// If we _actually_ rendered the template to disk, we want to run the
@@ -572,7 +575,7 @@ func (r *Runner) Run() error {
 	}
 
 	// Check if we need to deliver any rendered signals
-	if renderedAny {
+	if wouldRenderAny || renderedAny {
 		// Send the signal that a template got rendered
 		select {
 		case r.renderedCh <- struct{}{}:
@@ -866,7 +869,15 @@ func (r *Runner) execute(command string, timeout time.Duration) error {
 	}
 
 	if r.config.Vault.SSL.Cert != "" {
-		customEnv["VAULT_CAPATH"] = r.config.Vault.SSL.Cert
+		customEnv["VAULT_CLIENT_CERT"] = r.config.Vault.SSL.Cert
+	}
+
+	if r.config.Vault.SSL.Key != "" {
+		customEnv["VAULT_CLIENT_KEY"] = r.config.Vault.SSL.Key
+	}
+
+	if r.config.Vault.SSL.CaPath != "" {
+		customEnv["VAULT_CAPATH"] = r.config.Vault.SSL.CaPath
 	}
 
 	if r.config.Vault.SSL.CaCert != "" {
@@ -1166,6 +1177,7 @@ func newClientSet(config *config.Config) (*dep.ClientSet, error) {
 		SSLCert:      config.SSL.Cert,
 		SSLKey:       config.SSL.Key,
 		SSLCACert:    config.SSL.CaCert,
+		SSLCAPath:    config.SSL.CaPath,
 		ServerName:   config.SSL.ServerName,
 	}); err != nil {
 		return nil, fmt.Errorf("runner: %s", err)
@@ -1180,6 +1192,7 @@ func newClientSet(config *config.Config) (*dep.ClientSet, error) {
 		SSLCert:     config.Vault.SSL.Cert,
 		SSLKey:      config.Vault.SSL.Key,
 		SSLCACert:   config.Vault.SSL.CaCert,
+		SSLCAPath:   config.Vault.SSL.CaPath,
 		ServerName:  config.Vault.SSL.ServerName,
 	}); err != nil {
 		return nil, fmt.Errorf("runner: %s", err)

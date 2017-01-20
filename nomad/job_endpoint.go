@@ -7,10 +7,12 @@ import (
 	"time"
 
 	"github.com/armon/go-metrics"
+	"github.com/golang/snappy"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/client/driver"
+	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/nomad/watch"
 	"github.com/hashicorp/nomad/scheduler"
@@ -20,6 +22,10 @@ const (
 	// RegisterEnforceIndexErrPrefix is the prefix to use in errors caused by
 	// enforcing the job modify index during registers.
 	RegisterEnforceIndexErrPrefix = "Enforcing job modify index"
+
+	// DispatchPayloadSizeLimit is the maximum size of the uncompressed input
+	// data payload.
+	DispatchPayloadSizeLimit = 16 * 1024
 )
 
 var (
@@ -51,6 +57,9 @@ func (j *Job) Register(args *structs.JobRegisterRequest, reply *structs.JobRegis
 
 	// Initialize the job fields (sets defaults and any necessary init work).
 	args.Job.Canonicalize()
+
+	// Add implicit constraints
+	setImplicitConstraints(args.Job)
 
 	// Validate the job.
 	if err := validateJob(args.Job); err != nil {
@@ -108,33 +117,11 @@ func (j *Job) Register(args *structs.JobRegisterRequest, reply *structs.JobRegis
 			// If we are given a root token it can access all policies
 			if !lib.StrContains(allowedPolicies, "root") {
 				flatPolicies := structs.VaultPoliciesSet(policies)
-				subset, offending := structs.SliceStringIsSubset(allowedPolicies, flatPolicies)
+				subset, offending := helper.SliceStringIsSubset(allowedPolicies, flatPolicies)
 				if !subset {
 					return fmt.Errorf("Passed Vault Token doesn't allow access to the following policies: %s",
 						strings.Join(offending, ", "))
 				}
-			}
-		}
-
-		// Add implicit constraints that the task groups are run on a Node with
-		// Vault
-		for _, tg := range args.Job.TaskGroups {
-			_, ok := policies[tg.Name]
-			if !ok {
-				// Not requesting Vault
-				continue
-			}
-
-			found := false
-			for _, c := range tg.Constraints {
-				if c.Equal(vaultConstraint) {
-					found = true
-					break
-				}
-			}
-
-			if !found {
-				tg.Constraints = append(tg.Constraints, vaultConstraint)
 			}
 		}
 	}
@@ -152,8 +139,8 @@ func (j *Job) Register(args *structs.JobRegisterRequest, reply *structs.JobRegis
 	// Populate the reply with job information
 	reply.JobModifyIndex = index
 
-	// If the job is periodic, we don't create an eval.
-	if args.Job.IsPeriodic() {
+	// If the job is periodic or a constructor, we don't create an eval.
+	if args.Job.IsPeriodic() || args.Job.IsConstructor() {
 		return nil
 	}
 
@@ -186,6 +173,77 @@ func (j *Job) Register(args *structs.JobRegisterRequest, reply *structs.JobRegis
 	reply.EvalCreateIndex = evalIndex
 	reply.Index = evalIndex
 	return nil
+}
+
+// setImplicitConstraints adds implicit constraints to the job based on the
+// features it is requesting.
+func setImplicitConstraints(j *structs.Job) {
+	// Get the required Vault Policies
+	policies := j.VaultPolicies()
+
+	// Get the required signals
+	signals := j.RequiredSignals()
+
+	// Hot path
+	if len(signals) == 0 && len(policies) == 0 {
+		return
+	}
+
+	// Add Vault constraints
+	for _, tg := range j.TaskGroups {
+		_, ok := policies[tg.Name]
+		if !ok {
+			// Not requesting Vault
+			continue
+		}
+
+		found := false
+		for _, c := range tg.Constraints {
+			if c.Equal(vaultConstraint) {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			tg.Constraints = append(tg.Constraints, vaultConstraint)
+		}
+	}
+
+	// Add signal constraints
+	for _, tg := range j.TaskGroups {
+		tgSignals, ok := signals[tg.Name]
+		if !ok {
+			// Not requesting Vault
+			continue
+		}
+
+		// Flatten the signals
+		required := helper.MapStringStringSliceValueSet(tgSignals)
+		sigConstraint := getSignalConstraint(required)
+
+		found := false
+		for _, c := range tg.Constraints {
+			if c.Equal(sigConstraint) {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			tg.Constraints = append(tg.Constraints, sigConstraint)
+		}
+	}
+}
+
+// getSignalConstraint builds a suitable constraint based on the required
+// signals
+func getSignalConstraint(signals []string) *structs.Constraint {
+	return &structs.Constraint{
+		Operand: structs.ConstraintSetContains,
+		LTarget: "${attr.os.signals}",
+		RTarget: strings.Join(signals, ","),
+	}
 }
 
 // Summary retreives the summary of a job
@@ -259,6 +317,8 @@ func (j *Job) Evaluate(args *structs.JobEvaluateRequest, reply *structs.JobRegis
 
 	if job.IsPeriodic() {
 		return fmt.Errorf("can't evaluate periodic job")
+	} else if job.IsConstructor() {
+		return fmt.Errorf("can't evaluate constructor job")
 	}
 
 	// Create a new evaluation
@@ -323,8 +383,8 @@ func (j *Job) Deregister(args *structs.JobDeregisterRequest, reply *structs.JobD
 	// Populate the reply with job information
 	reply.JobModifyIndex = index
 
-	// If the job is periodic, we don't create an eval.
-	if job != nil && job.IsPeriodic() {
+	// If the job is periodic or a construcotr, we don't create an eval.
+	if job != nil && (job.IsPeriodic() || job.IsConstructor()) {
 		return nil
 	}
 
@@ -482,7 +542,7 @@ func (j *Job) Allocations(args *structs.JobSpecificRequest,
 			if err != nil {
 				return err
 			}
-			allocs, err := snap.AllocsByJob(args.JobID)
+			allocs, err := snap.AllocsByJob(args.JobID, args.AllAllocs)
 			if err != nil {
 				return err
 			}
@@ -518,26 +578,36 @@ func (j *Job) Evaluations(args *structs.JobSpecificRequest,
 	}
 	defer metrics.MeasureSince([]string{"nomad", "job", "evaluations"}, time.Now())
 
-	// Capture the evaluations
-	snap, err := j.srv.fsm.State().Snapshot()
-	if err != nil {
-		return err
-	}
-	reply.Evaluations, err = snap.EvalsByJob(args.JobID)
-	if err != nil {
-		return err
-	}
+	// Setup the blocking query
+	opts := blockingOptions{
+		queryOpts: &args.QueryOptions,
+		queryMeta: &reply.QueryMeta,
+		watch:     watch.NewItems(watch.Item{EvalJob: args.JobID}),
+		run: func() error {
+			// Capture the evals
+			snap, err := j.srv.fsm.State().Snapshot()
+			if err != nil {
+				return err
+			}
 
-	// Use the last index that affected the evals table
-	index, err := snap.Index("evals")
-	if err != nil {
-		return err
-	}
-	reply.Index = index
+			reply.Evaluations, err = snap.EvalsByJob(args.JobID)
+			if err != nil {
+				return err
+			}
 
-	// Set the query response
-	j.srv.setQueryMeta(&reply.QueryMeta)
-	return nil
+			// Use the last index that affected the evals table
+			index, err := snap.Index("evals")
+			if err != nil {
+				return err
+			}
+			reply.Index = index
+
+			// Set the query response
+			j.srv.setQueryMeta(&reply.QueryMeta)
+			return nil
+		}}
+
+	return j.srv.blockingRPC(&opts)
 }
 
 // Plan is used to cause a dry-run evaluation of the Job and return the results
@@ -555,6 +625,9 @@ func (j *Job) Plan(args *structs.JobPlanRequest, reply *structs.JobPlanResponse)
 
 	// Initialize the job fields (sets defaults and any necessary init work).
 	args.Job.Canonicalize()
+
+	// Add implicit constraints
+	setImplicitConstraints(args.Job)
 
 	// Validate the job.
 	if err := validateJob(args.Job); err != nil {
@@ -656,8 +729,14 @@ func validateJob(job *structs.Job) error {
 		multierror.Append(validationErrors, err)
 	}
 
+	// Get the signals required
+	signals := job.RequiredSignals()
+
 	// Validate the driver configurations.
 	for _, tg := range job.TaskGroups {
+		// Get the signals for the task group
+		tgSignals, tgOk := signals[tg.Name]
+
 		for _, task := range tg.Tasks {
 			d, err := driver.NewDriver(
 				task.Driver,
@@ -673,6 +752,21 @@ func validateJob(job *structs.Job) error {
 				formatted := fmt.Errorf("group %q -> task %q -> config: %v", tg.Name, task.Name, err)
 				multierror.Append(validationErrors, formatted)
 			}
+
+			// The task group didn't have any task that required signals
+			if !tgOk {
+				continue
+			}
+
+			// This task requires signals. Ensure the driver is capable
+			if required, ok := tgSignals[task.Name]; ok {
+				abilities := d.Abilities()
+				if !abilities.SendSignals {
+					formatted := fmt.Errorf("group %q -> task %q: driver %q doesn't support sending signals. Requested signals are %v",
+						tg.Name, task.Name, task.Driver, strings.Join(required, ", "))
+					multierror.Append(validationErrors, formatted)
+				}
+			}
 		}
 	}
 
@@ -680,5 +774,169 @@ func validateJob(job *structs.Job) error {
 		multierror.Append(validationErrors, fmt.Errorf("job type cannot be core"))
 	}
 
+	if len(job.Payload) != 0 {
+		multierror.Append(validationErrors, fmt.Errorf("job can't be submitted with a payload, only dispatched"))
+	}
+
 	return validationErrors.ErrorOrNil()
+}
+
+// Dispatch is used to dispatch a job based on a constructor job.
+func (j *Job) Dispatch(args *structs.JobDispatchRequest, reply *structs.JobDispatchResponse) error {
+	if done, err := j.srv.forward("Job.Dispatch", args, args, reply); done {
+		return err
+	}
+	defer metrics.MeasureSince([]string{"nomad", "job", "dispatch"}, time.Now())
+
+	// Lookup the job
+	if args.JobID == "" {
+		return fmt.Errorf("missing constructor job ID")
+	}
+
+	snap, err := j.srv.fsm.State().Snapshot()
+	if err != nil {
+		return err
+	}
+	constructor, err := snap.JobByID(args.JobID)
+	if err != nil {
+		return err
+	}
+	if constructor == nil {
+		return fmt.Errorf("constructor job not found")
+	}
+
+	if !constructor.IsConstructor() {
+		return fmt.Errorf("Specified job %q is not a constructor job", args.JobID)
+	}
+
+	// Validate the arguments
+	if err := validateDispatchRequest(args, constructor); err != nil {
+		return err
+	}
+
+	// Derive the child job and commit it via Raft
+	dispatchJob := constructor.Copy()
+	dispatchJob.Constructor = nil
+	dispatchJob.ID = structs.DispatchedID(constructor.ID, time.Now())
+	dispatchJob.ParentID = constructor.ID
+	dispatchJob.Name = dispatchJob.ID
+
+	// Merge in the meta data
+	for k, v := range args.Meta {
+		if dispatchJob.Meta == nil {
+			dispatchJob.Meta = make(map[string]string, len(args.Meta))
+		}
+		dispatchJob.Meta[k] = v
+	}
+
+	// Compress the payload
+	dispatchJob.Payload = snappy.Encode(nil, args.Payload)
+
+	regReq := &structs.JobRegisterRequest{
+		Job:          dispatchJob,
+		WriteRequest: args.WriteRequest,
+	}
+
+	// Commit this update via Raft
+	_, jobCreateIndex, err := j.srv.raftApply(structs.JobRegisterRequestType, regReq)
+	if err != nil {
+		j.srv.logger.Printf("[ERR] nomad.job: Dispatched job register failed: %v", err)
+		return err
+	}
+
+	// Create a new evaluation
+	eval := &structs.Evaluation{
+		ID:             structs.GenerateUUID(),
+		Priority:       dispatchJob.Priority,
+		Type:           dispatchJob.Type,
+		TriggeredBy:    structs.EvalTriggerJobRegister,
+		JobID:          dispatchJob.ID,
+		JobModifyIndex: jobCreateIndex,
+		Status:         structs.EvalStatusPending,
+	}
+	update := &structs.EvalUpdateRequest{
+		Evals:        []*structs.Evaluation{eval},
+		WriteRequest: structs.WriteRequest{Region: args.Region},
+	}
+
+	// Commit this evaluation via Raft
+	_, evalIndex, err := j.srv.raftApply(structs.EvalUpdateRequestType, update)
+	if err != nil {
+		j.srv.logger.Printf("[ERR] nomad.job: Eval create failed: %v", err)
+		return err
+	}
+
+	// Setup the reply
+	reply.EvalID = eval.ID
+	reply.EvalCreateIndex = evalIndex
+	reply.JobCreateIndex = jobCreateIndex
+	reply.DispatchedJobID = dispatchJob.ID
+	reply.Index = evalIndex
+	return nil
+}
+
+// validateDispatchRequest returns whether the request is valid given the
+// jobs constructor
+func validateDispatchRequest(req *structs.JobDispatchRequest, job *structs.Job) error {
+	// Check the payload constraint is met
+	hasInputData := len(req.Payload) != 0
+	if job.Constructor.Payload == structs.DispatchPayloadRequired && !hasInputData {
+		return fmt.Errorf("Payload is not provided but required by constructor")
+	} else if job.Constructor.Payload == structs.DispatchPayloadForbidden && hasInputData {
+		return fmt.Errorf("Payload provided but forbidden by constructor")
+	}
+
+	// Check the payload doesn't exceed the size limit
+	if l := len(req.Payload); l > DispatchPayloadSizeLimit {
+		return fmt.Errorf("Payload exceeds maximum size; %d > %d", l, DispatchPayloadSizeLimit)
+	}
+
+	// Check if the metadata is a set
+	keys := make(map[string]struct{}, len(req.Meta))
+	for k := range keys {
+		if _, ok := keys[k]; ok {
+			return fmt.Errorf("Duplicate key %q in passed metadata", k)
+		}
+		keys[k] = struct{}{}
+	}
+
+	required := helper.SliceStringToSet(job.Constructor.MetaRequired)
+	optional := helper.SliceStringToSet(job.Constructor.MetaOptional)
+
+	// Check the metadata key constraints are met
+	unpermitted := make(map[string]struct{})
+	for k := range req.Meta {
+		_, req := required[k]
+		_, opt := optional[k]
+		if !req && !opt {
+			unpermitted[k] = struct{}{}
+		}
+	}
+
+	if len(unpermitted) != 0 {
+		flat := make([]string, 0, len(unpermitted))
+		for k := range unpermitted {
+			flat = append(flat, k)
+		}
+
+		return fmt.Errorf("Dispatch request included unpermitted metadata keys: %v", flat)
+	}
+
+	missing := make(map[string]struct{})
+	for _, k := range job.Constructor.MetaRequired {
+		if _, ok := req.Meta[k]; !ok {
+			missing[k] = struct{}{}
+		}
+	}
+
+	if len(missing) != 0 {
+		flat := make([]string, 0, len(missing))
+		for k := range missing {
+			flat = append(flat, k)
+		}
+
+		return fmt.Errorf("Dispatch did not provide required meta keys: %v", flat)
+	}
+
+	return nil
 }

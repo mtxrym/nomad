@@ -120,6 +120,15 @@ func (c *Command) readConfig() *Config {
 	}), "vault-allow-unauthenticated", "")
 	flags.StringVar(&cmdConfig.Vault.Token, "vault-token", "", "")
 	flags.StringVar(&cmdConfig.Vault.Addr, "vault-address", "", "")
+	flags.StringVar(&cmdConfig.Vault.TLSCaFile, "vault-ca-file", "", "")
+	flags.StringVar(&cmdConfig.Vault.TLSCaPath, "vault-ca-path", "", "")
+	flags.StringVar(&cmdConfig.Vault.TLSCertFile, "vault-cert-file", "", "")
+	flags.StringVar(&cmdConfig.Vault.TLSKeyFile, "vault-key-file", "", "")
+	flags.Var((flaghelper.FuncBoolVar)(func(b bool) error {
+		cmdConfig.Vault.TLSSkipVerify = &b
+		return nil
+	}), "vault-tls-skip-verify", "")
+	flags.StringVar(&cmdConfig.Vault.TLSServerName, "vault-tls-server-name", "", "")
 
 	if err := flags.Parse(c.args); err != nil {
 		return nil
@@ -192,6 +201,19 @@ func (c *Command) readConfig() *Config {
 	config.Version = c.Version
 	config.VersionPrerelease = c.VersionPrerelease
 
+	// Normalize binds, ports, addresses, and advertise
+	if err := config.normalizeAddrs(); err != nil {
+		c.Ui.Error(err.Error())
+		return nil
+	}
+
+	// Check to see if we should read the Vault token from the environment
+	if config.Vault.Token == "" {
+		if token, ok := os.LookupEnv("VAULT_TOKEN"); ok {
+			config.Vault.Token = token
+		}
+	}
+
 	if dev {
 		// Skip validation for dev mode
 		return config
@@ -204,7 +226,7 @@ func (c *Command) readConfig() *Config {
 		}
 		keyfile := filepath.Join(config.DataDir, serfKeyring)
 		if _, err := os.Stat(keyfile); err == nil {
-			c.Ui.Error("WARNING: keyring exists but -encrypt given, using keyring")
+			c.Ui.Warn("WARNING: keyring exists but -encrypt given, using keyring")
 		}
 	}
 
@@ -446,6 +468,7 @@ func (c *Command) Run(args []string) int {
 
 	// Compile agent information for output later
 	info := make(map[string]string)
+	info["version"] = fmt.Sprintf("%s%s", config.Version, config.VersionPrerelease)
 	info["client"] = strconv.FormatBool(config.Client.Enabled)
 	info["log level"] = config.LogLevel
 	info["server"] = strconv.FormatBool(config.Server.Enabled)
@@ -598,6 +621,10 @@ func (c *Command) setupTelemetry(config *Config) error {
 
 	metricsConf := metrics.DefaultConfig("nomad")
 	metricsConf.EnableHostname = !telConfig.DisableHostname
+	if telConfig.UseNodeName {
+		metricsConf.HostName = config.NodeName
+		metricsConf.EnableHostname = true
+	}
 
 	// Configure the statsite sink
 	var fanout metrics.FanoutSink
@@ -639,17 +666,13 @@ func (c *Command) setupTelemetry(config *Config) error {
 		cfg.CheckManager.Check.ForceMetricActivation = telConfig.CirconusCheckForceMetricActivation
 		cfg.CheckManager.Check.InstanceID = telConfig.CirconusCheckInstanceID
 		cfg.CheckManager.Check.SearchTag = telConfig.CirconusCheckSearchTag
+		cfg.CheckManager.Check.Tags = telConfig.CirconusCheckTags
+		cfg.CheckManager.Check.DisplayName = telConfig.CirconusCheckDisplayName
 		cfg.CheckManager.Broker.ID = telConfig.CirconusBrokerID
 		cfg.CheckManager.Broker.SelectTag = telConfig.CirconusBrokerSelectTag
 
 		if cfg.CheckManager.API.TokenApp == "" {
 			cfg.CheckManager.API.TokenApp = "nomad"
-		}
-
-		if cfg.CheckManager.Check.InstanceID == "" {
-			if config.NodeName != "" && config.Datacenter != "" {
-				cfg.CheckManager.Check.InstanceID = fmt.Sprintf("%s:%s", config.NodeName, config.Datacenter)
-			}
 		}
 
 		if cfg.CheckManager.Check.SearchTag == "" {
@@ -908,11 +931,32 @@ Vault Options:
 
   -vault-token=<token>
     The Vault token used to derive tokens from Vault on behalf of clients.
-    This only needs to be set on Servers.
+    This only needs to be set on Servers. Overrides the Vault token read from
+    the VAULT_TOKEN environment variable.
 
   -vault-allow-unauthenticated
     Whether to allow jobs to be sumbitted that request Vault Tokens but do not
     authentication. The flag only applies to Servers.
+
+  -vault-ca-file=<path>
+    The path to a PEM-encoded CA cert file to use to verify the Vault server SSL
+    certificate.
+
+  -vault-ca-path=<path>
+    The path to a directory of PEM-encoded CA cert files to verify the Vault server
+    certificate.
+
+  -vault-cert-file=<token>
+    The path to the certificate for Vault communication.
+
+  -vault-key-file=<addr>
+    The path to the private key for Vault communication.
+
+  -vault-tls-skip-verify=<token>
+    Enables or disables SSL certificate verification.
+
+  -vault-tls-server-name=<token>
+    Used to set the SNI host when connecting over TLS.
 
 Atlas Options:
 

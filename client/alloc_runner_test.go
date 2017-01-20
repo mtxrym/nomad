@@ -1,14 +1,15 @@
 package client
 
 import (
-	"bufio"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
+	"text/template"
 	"time"
 
+	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/testutil"
@@ -75,8 +76,16 @@ func TestAllocRunner_RetryArtifact(t *testing.T) {
 
 	alloc := mock.Alloc()
 	alloc.Job.Type = structs.JobTypeBatch
+	alloc.Job.TaskGroups[0].RestartPolicy.Mode = structs.RestartPolicyModeFail
 	alloc.Job.TaskGroups[0].RestartPolicy.Attempts = 1
 	alloc.Job.TaskGroups[0].RestartPolicy.Delay = time.Duration(4*testutil.TestMultiplier()) * time.Second
+
+	task := alloc.Job.TaskGroups[0].Tasks[0]
+	task.Driver = "mock_driver"
+	task.Config = map[string]interface{}{
+		"exit_code": "0",
+		"run_for":   "1s",
+	}
 
 	// Create a new task with a bad artifact
 	badtask := alloc.Job.TaskGroups[0].Tasks[0].Copy()
@@ -109,10 +118,10 @@ func TestAllocRunner_RetryArtifact(t *testing.T) {
 		// bad task should have failed
 		badstate := last.TaskStates["bad"]
 		if badstate.State != structs.TaskStateDead {
-			return false, fmt.Errorf("expected bad to be dead but found %q", last.TaskStates["web"].State)
+			return false, fmt.Errorf("expected bad to be dead but found %q", badstate.State)
 		}
-		if !badstate.Failed() {
-			return false, fmt.Errorf("expected bad to have failed")
+		if !badstate.Failed {
+			return false, fmt.Errorf("expected bad to have failed: %#v", badstate.Events)
 		}
 		return true, nil
 	}, func(err error) {
@@ -166,8 +175,8 @@ func TestAllocRunner_TerminalUpdate_Destroy(t *testing.T) {
 		}
 
 		// Check the alloc directory still exists
-		if _, err := os.Stat(ar.ctx.AllocDir.AllocDir); err != nil {
-			return false, fmt.Errorf("alloc dir destroyed: %v", ar.ctx.AllocDir.AllocDir)
+		if _, err := os.Stat(ar.allocDir.AllocDir); err != nil {
+			return false, fmt.Errorf("alloc dir destroyed: %v", ar.allocDir.AllocDir)
 		}
 
 		return true, nil
@@ -197,8 +206,8 @@ func TestAllocRunner_TerminalUpdate_Destroy(t *testing.T) {
 		}
 
 		// Check the alloc directory was cleaned
-		if _, err := os.Stat(ar.ctx.AllocDir.AllocDir); err == nil {
-			return false, fmt.Errorf("alloc dir still exists: %v", ar.ctx.AllocDir.AllocDir)
+		if _, err := os.Stat(ar.allocDir.AllocDir); err == nil {
+			return false, fmt.Errorf("alloc dir still exists: %v", ar.allocDir.AllocDir)
 		} else if !os.IsNotExist(err) {
 			return false, fmt.Errorf("stat err: %v", err)
 		}
@@ -209,112 +218,6 @@ func TestAllocRunner_TerminalUpdate_Destroy(t *testing.T) {
 	})
 }
 
-func TestAllocRunner_DiskExceeded_Destroy(t *testing.T) {
-	ctestutil.ExecCompatible(t)
-	upd, ar := testAllocRunner(false)
-
-	// Ensure task takes some time
-	task := ar.alloc.Job.TaskGroups[0].Tasks[0]
-	task.Config["command"] = "/bin/sleep"
-	task.Config["args"] = []string{"60"}
-	go ar.Run()
-
-	testutil.WaitForResult(func() (bool, error) {
-		if upd.Count == 0 {
-			return false, fmt.Errorf("No updates")
-		}
-		last := upd.Allocs[upd.Count-1]
-		if last.ClientStatus != structs.AllocClientStatusRunning {
-			return false, fmt.Errorf("got status %v; want %v", last.ClientStatus, structs.AllocClientStatusRunning)
-		}
-		return true, nil
-	}, func(err error) {
-		t.Fatalf("err: %v", err)
-	})
-
-	// Create a 20mb file in the alloc directory, which should cause the
-	// allocation to terminate in a failed state.
-	name := ar.ctx.AllocDir.AllocDir + "/20mb.bin"
-	f, err := os.Create(name)
-	if err != nil {
-		t.Fatal("unable to create file: %v", err)
-	}
-
-	defer func() {
-		if err := f.Close(); err != nil {
-			t.Fatal("unable to close file: %v", err)
-		}
-		os.Remove(name)
-	}()
-
-	// write 20 megabytes (1280 * 16384 bytes) of zeros to the file
-	w := bufio.NewWriter(f)
-	buf := make([]byte, 16384)
-	for i := 0; i < 1280; i++ {
-		if _, err := w.Write(buf); err != nil {
-			t.Fatal("unable to write to file: %v", err)
-		}
-	}
-
-	testutil.WaitForResult(func() (bool, error) {
-		if upd.Count == 0 {
-			return false, nil
-		}
-
-		// Check the status has changed.
-		last := upd.Allocs[upd.Count-1]
-		if last.ClientStatus != structs.AllocClientStatusFailed {
-			return false, fmt.Errorf("got client status %v; want %v", last.ClientStatus, structs.AllocClientStatusFailed)
-		}
-
-		// Check the state still exists
-		if _, err := os.Stat(ar.stateFilePath()); err != nil {
-			return false, fmt.Errorf("state file destroyed: %v", err)
-		}
-
-		// Check the alloc directory still exists
-		if _, err := os.Stat(ar.ctx.AllocDir.AllocDir); err != nil {
-			return false, fmt.Errorf("alloc dir destroyed: %v", ar.ctx.AllocDir.AllocDir)
-		}
-
-		return true, nil
-	}, func(err error) {
-		t.Fatalf("err: %v", err)
-	})
-
-	// Send the destroy signal and ensure the AllocRunner cleans up.
-	ar.Destroy()
-
-	testutil.WaitForResult(func() (bool, error) {
-		if upd.Count == 0 {
-			return false, nil
-		}
-
-		// Check the status has changed.
-		last := upd.Allocs[upd.Count-1]
-		if last.ClientStatus != structs.AllocClientStatusFailed {
-			return false, fmt.Errorf("got client status %v; want %v", last.ClientStatus, structs.AllocClientStatusFailed)
-		}
-
-		// Check the state was cleaned
-		if _, err := os.Stat(ar.stateFilePath()); err == nil {
-			return false, fmt.Errorf("state file still exists: %v", ar.stateFilePath())
-		} else if !os.IsNotExist(err) {
-			return false, fmt.Errorf("stat err: %v", err)
-		}
-
-		// Check the alloc directory was cleaned
-		if _, err := os.Stat(ar.ctx.AllocDir.AllocDir); err == nil {
-			return false, fmt.Errorf("alloc dir still exists: %v", ar.ctx.AllocDir.AllocDir)
-		} else if !os.IsNotExist(err) {
-			return false, fmt.Errorf("stat err: %v", err)
-		}
-
-		return true, nil
-	}, func(err error) {
-		t.Fatalf("err: %v", err)
-	})
-}
 func TestAllocRunner_Destroy(t *testing.T) {
 	ctestutil.ExecCompatible(t)
 	upd, ar := testAllocRunner(false)
@@ -351,8 +254,8 @@ func TestAllocRunner_Destroy(t *testing.T) {
 		}
 
 		// Check the alloc directory was cleaned
-		if _, err := os.Stat(ar.ctx.AllocDir.AllocDir); err == nil {
-			return false, fmt.Errorf("alloc dir still exists: %v", ar.ctx.AllocDir.AllocDir)
+		if _, err := os.Stat(ar.allocDir.AllocDir); err == nil {
+			return false, fmt.Errorf("alloc dir still exists: %v", ar.allocDir.AllocDir)
 		} else if !os.IsNotExist(err) {
 			return false, fmt.Errorf("stat err: %v", err)
 		}
@@ -362,8 +265,8 @@ func TestAllocRunner_Destroy(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	})
 
-	if time.Since(start) > 15*time.Second {
-		t.Fatalf("took too long to terminate")
+	if elapsed := time.Since(start); elapsed > 20*time.Second {
+		t.Fatalf("took too long to terminate: %s", elapsed)
 	}
 }
 
@@ -523,8 +426,8 @@ func TestAllocRunner_SaveRestoreState_TerminalAlloc(t *testing.T) {
 		}
 
 		// Check the alloc directory still exists
-		if _, err := os.Stat(ar.ctx.AllocDir.AllocDir); err != nil {
-			return false, fmt.Errorf("alloc dir destroyed: %v", ar.ctx.AllocDir.AllocDir)
+		if _, err := os.Stat(ar.allocDir.AllocDir); err != nil {
+			return false, fmt.Errorf("alloc dir destroyed: %v", ar.allocDir.AllocDir)
 		}
 
 		return true, nil
@@ -555,8 +458,8 @@ func TestAllocRunner_SaveRestoreState_TerminalAlloc(t *testing.T) {
 		}
 
 		// Check the alloc directory was cleaned
-		if _, err := os.Stat(ar.ctx.AllocDir.AllocDir); err == nil {
-			return false, fmt.Errorf("alloc dir still exists: %v", ar.ctx.AllocDir.AllocDir)
+		if _, err := os.Stat(ar.allocDir.AllocDir); err == nil {
+			return false, fmt.Errorf("alloc dir still exists: %v", ar.allocDir.AllocDir)
 		} else if !os.IsNotExist(err) {
 			return false, fmt.Errorf("stat err: %v", err)
 		}
@@ -565,6 +468,129 @@ func TestAllocRunner_SaveRestoreState_TerminalAlloc(t *testing.T) {
 	}, func(err error) {
 		t.Fatalf("err: %v", err)
 	})
+}
+
+// Ensure pre-#2132 state files containing the Context struct are properly
+// migrated to the new format.
+//
+// Old Context State:
+//
+//  "Context": {
+//    "AllocDir": {
+//      "AllocDir": "/path/to/allocs/2a54fcff-fc44-8d4f-e025-53c48e9cbbbb",
+//      "SharedDir": "/path/to/allocs/2a54fcff-fc44-8d4f-e025-53c48e9cbbbb/alloc",
+//      "TaskDirs": {
+//        "echo1": "/path/to/allocs/2a54fcff-fc44-8d4f-e025-53c48e9cbbbb/echo1"
+//      }
+//    },
+//    "AllocID": "2a54fcff-fc44-8d4f-e025-53c48e9cbbbb"
+//  }
+func TestAllocRunner_RestoreOldState(t *testing.T) {
+	alloc := mock.Alloc()
+	task := alloc.Job.TaskGroups[0].Tasks[0]
+	task.Driver = "mock_driver"
+	task.Config = map[string]interface{}{
+		"exit_code": "0",
+		"run_for":   "10s",
+	}
+
+	logger := testLogger()
+	conf := config.DefaultConfig()
+	conf.StateDir = os.TempDir()
+	conf.AllocDir = os.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(conf.StateDir, "alloc", alloc.ID), 0777); err != nil {
+		t.Fatalf("error creating state dir: %v", err)
+	}
+	statePath := filepath.Join(conf.StateDir, "alloc", alloc.ID, "state.json")
+	w, err := os.Create(statePath)
+	if err != nil {
+		t.Fatalf("error creating state file: %v", err)
+	}
+	tmplctx := &struct {
+		AllocID  string
+		AllocDir string
+	}{alloc.ID, conf.AllocDir}
+	err = template.Must(template.New("test_state").Parse(`{
+  "Version": "0.5.1",
+  "Alloc": {
+    "ID": "{{ .AllocID }}",
+    "Name": "example",
+    "JobID": "example",
+    "Job": {
+      "ID": "example",
+      "Name": "example",
+      "Type": "batch",
+      "TaskGroups": [
+        {
+          "Name": "example",
+          "Tasks": [
+            {
+              "Name": "example",
+              "Driver": "mock",
+              "Config": {
+                "exit_code": "0",
+		"run_for": "10s"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "TaskGroup": "example",
+    "DesiredStatus": "run",
+    "ClientStatus": "running",
+    "TaskStates": {
+      "example": {
+        "State": "running",
+        "Failed": false,
+        "Events": []
+      }
+    }
+  },
+  "Context": {
+    "AllocDir": {
+      "AllocDir": "{{ .AllocDir }}/{{ .AllocID }}",
+      "SharedDir": "{{ .AllocDir }}/{{ .AllocID }}/alloc",
+      "TaskDirs": {
+        "example": "{{ .AllocDir }}/{{ .AllocID }}/example"
+      }
+    },
+    "AllocID": "{{ .AllocID }}"
+  }
+}`)).Execute(w, tmplctx)
+	if err != nil {
+		t.Fatalf("error writing state file: %v", err)
+	}
+	w.Close()
+
+	upd := &MockAllocStateUpdater{}
+	*alloc.Job.LookupTaskGroup(alloc.TaskGroup).RestartPolicy = structs.RestartPolicy{Attempts: 0}
+	alloc.Job.Type = structs.JobTypeBatch
+	vclient := vaultclient.NewMockVaultClient()
+	ar := NewAllocRunner(logger, conf, upd.Update, alloc, vclient)
+	defer ar.Destroy()
+
+	// RestoreState should fail on the task state since we only test the
+	// alloc state restoring.
+	err = ar.RestoreState()
+	if err == nil {
+		t.Fatal("expected error restoring Task state")
+	}
+	merr, ok := err.(*multierror.Error)
+	if !ok {
+		t.Fatalf("expected RestoreState to return a multierror but found: %T -> %v", err, err)
+	}
+	if len(merr.Errors) != 1 {
+		t.Fatalf("expected exactly 1 error from RestoreState but found: %d: %v", len(merr.Errors), err)
+	}
+	if expected := "task runner snapshot includes nil Task"; merr.Errors[0].Error() != expected {
+		t.Fatalf("expected %q but got: %q", merr.Errors[0].Error())
+	}
+
+	if err := ar.SaveState(); err != nil {
+		t.Fatalf("error saving new state: %v", err)
+	}
 }
 
 func TestAllocRunner_TaskFailed_KillTG(t *testing.T) {
@@ -610,7 +636,7 @@ func TestAllocRunner_TaskFailed_KillTG(t *testing.T) {
 		if state2.State != structs.TaskStateDead {
 			return false, fmt.Errorf("got state %v; want %v", state2.State, structs.TaskStateDead)
 		}
-		if !state2.Failed() {
+		if !state2.Failed {
 			return false, fmt.Errorf("task2 should have failed")
 		}
 
@@ -645,21 +671,21 @@ func TestAllocRunner_MoveAllocDir(t *testing.T) {
 	})
 
 	// Write some data in data dir and task dir of the alloc
-	dataFile := filepath.Join(ar.ctx.AllocDir.SharedDir, "data", "data_file")
+	dataFile := filepath.Join(ar.allocDir.SharedDir, "data", "data_file")
 	ioutil.WriteFile(dataFile, []byte("hello world"), os.ModePerm)
-	taskDir := ar.ctx.AllocDir.TaskDirs[task.Name]
-	taskLocalFile := filepath.Join(taskDir, "local", "local_file")
+	taskDir := ar.allocDir.TaskDirs[task.Name]
+	taskLocalFile := filepath.Join(taskDir.LocalDir, "local_file")
 	ioutil.WriteFile(taskLocalFile, []byte("good bye world"), os.ModePerm)
 
 	// Create another alloc runner
 	alloc1 := mock.Alloc()
-	task = alloc.Job.TaskGroups[0].Tasks[0]
+	task = alloc1.Job.TaskGroups[0].Tasks[0]
 	task.Driver = "mock_driver"
 	task.Config = map[string]interface{}{
 		"run_for": "1s",
 	}
 	upd1, ar1 := testAllocRunnerFromAlloc(alloc1, false)
-	ar1.SetPreviousAllocDir(ar.ctx.AllocDir)
+	ar1.SetPreviousAllocDir(ar.allocDir)
 	go ar1.Run()
 
 	testutil.WaitForResult(func() (bool, error) {
@@ -676,13 +702,13 @@ func TestAllocRunner_MoveAllocDir(t *testing.T) {
 	})
 
 	// Ensure that data from ar1 was moved to ar
-	taskDir = ar1.ctx.AllocDir.TaskDirs[task.Name]
-	taskLocalFile = filepath.Join(taskDir, "local", "local_file")
+	taskDir = ar1.allocDir.TaskDirs[task.Name]
+	taskLocalFile = filepath.Join(taskDir.LocalDir, "local_file")
 	if fileInfo, _ := os.Stat(taskLocalFile); fileInfo == nil {
 		t.Fatalf("file %v not found", taskLocalFile)
 	}
 
-	dataFile = filepath.Join(ar1.ctx.AllocDir.SharedDir, "data", "data_file")
+	dataFile = filepath.Join(ar1.allocDir.SharedDir, "data", "data_file")
 	if fileInfo, _ := os.Stat(dataFile); fileInfo == nil {
 		t.Fatalf("file %v not found", dataFile)
 	}
